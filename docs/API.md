@@ -625,7 +625,7 @@ GET /download?key=path/to/file.zip&bucket=3&apikey=YOUR_KEY
 [
   {"id": 1, "name": "自己桶1", "bucket_name": "mybucket", "application_key_id": "0051...",
    "has_application_key": true, "endpoint": null, "region": "us-west-004",
-   "addressing_style": "auto", "legacy_key": "self", "is_default": true,
+   "addressing_style": "auto", "signature_version": "s3v4", "legacy_key": "self", "is_default": true,
    "enabled": true, "sort_order": 0, "created_at": 123, "updated_at": 456}
 ]
 ```
@@ -647,6 +647,7 @@ Content-Type: application/json
   "endpoint": "tos-s3-cn-beijing.volces.com",
   "region": "cn-beijing",
   "addressing_style": "virtual",
+  "signature_version": "s3v4",
   "sort_order": 10,
   "is_default": false
 }
@@ -659,6 +660,7 @@ Content-Type: application/json
 | `application_key_id` / `application_key` | 是 | 凭证 |
 | `endpoint` / `region` | 否 | 二者至少一个；都不填则尝试从 keyID 解析 |
 | `addressing_style` | 否 | `auto`（默认）/ `virtual` / `path` |
+| `signature_version` | 否 | S3 签名版本：`s3v4`（默认，AWS/B2/TOS）/ `s3`（华为云 OBS 的 S3 兼容层只认 V2） |
 | `sort_order` | 否 | 排序值（默认 0） |
 | `is_default` | 否 | 设为默认桶会清掉其它桶的默认标记 |
 
@@ -667,8 +669,11 @@ Content-Type: application/json
 #### PATCH /api/buckets/:bucket_id
 
 编辑桶（子集更新）。`application_key` 为空/缺省 = 保留旧值；`endpoint` / `region` 传空字符串 = 清除。
-凭证 / endpoint / 桶名 / 寻址风格变更后缓存客户端自动失效重建。
+凭证 / endpoint / 桶名 / 寻址风格 / 签名版本变更后缓存客户端自动失效重建。
 清除当前默认桶的 `is_default` 返回 `400`（必须保留一个默认桶）。
+
+> 只写权限桶说明：`signature_version=s3` 的华为云 OBS 交付桶 AK 无读权限，
+> 上传后的大小核对（head_object 403）自动跳过、同名预检按"不存在"放行，均不算失败。
 
 #### DELETE /api/buckets/:bucket_id
 

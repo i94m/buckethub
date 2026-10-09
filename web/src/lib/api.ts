@@ -129,6 +129,7 @@ export interface Bucket extends BucketInfo {
   endpoint: string | null
   region: string | null
   addressing_style: string
+  signature_version: string
   enabled: boolean
   sort_order: number
   created_at: number
@@ -144,6 +145,7 @@ export interface BucketCreateData {
   endpoint?: string
   region?: string
   addressing_style?: string
+  signature_version?: string
   sort_order?: number
   is_default?: boolean
 }

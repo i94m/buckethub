@@ -182,8 +182,13 @@ def _build_client(row: dict):
     """按 buckets 表行构建一个 S3 客户端（不缓存，test 端点也用它）。"""
     endpoint, region = _resolve_bucket_endpoint(row.get("endpoint"), row.get("region"))
     addressing = (row.get("addressing_style") or "auto").strip()
+    # 签名版本按桶可配：AWS / B2 / TOS 走 s3v4；华为云 OBS 的 S3 兼容层
+    # 对 SigV4 的 PUT 报 400（payload SHA256 校验不兼容），需用 s3（SigV2）。
+    signature = (row.get("signature_version") or "s3v4").strip()
+    if signature not in ("s3", "s3v4"):
+        signature = "s3v4"
     config_kwargs: dict = {
-        "signature_version": "s3v4",
+        "signature_version": signature,
         "retries": {"max_attempts": 8, "mode": "standard"},
     }
     if addressing in ("virtual", "path"):
@@ -478,6 +483,7 @@ def init_db() -> None:
                 endpoint VARCHAR(512),
                 region VARCHAR(64),
                 addressing_style VARCHAR(20) NOT NULL DEFAULT 'auto',
+                signature_version VARCHAR(10) NOT NULL DEFAULT 's3v4',
                 legacy_key VARCHAR(20) NULL UNIQUE,
                 is_default TINYINT NOT NULL DEFAULT 0,
                 enabled TINYINT NOT NULL DEFAULT 1,
@@ -487,6 +493,12 @@ def init_db() -> None:
             )
             """
         )
+        # 兼容旧库：buckets 表补齐新增列（signature_version：S3 签名版本，见 _build_client）
+        bucket_columns = {row["Field"] for row in conn.execute("SHOW COLUMNS FROM buckets")}
+        if "signature_version" not in bucket_columns:
+            conn.execute(
+                "ALTER TABLE buckets ADD COLUMN signature_version VARCHAR(10) NOT NULL DEFAULT 's3v4'"
+            )
         # 文件 ↔ 桶 上传关联表（替代 files.uploaded / uploaded_beijing / uploaded_bucket2）
         conn.execute(
             """
@@ -727,13 +739,19 @@ def filename_from_url(url: str) -> str:
 
 
 def object_exists(client, bucket_name: str, object_key: str) -> bool:
-    """head_object 成功即存在；404/NotFound 视为不存在；其它异常抛出。"""
+    """head_object 成功即存在；404/NotFound 视为不存在；其它异常抛出。
+
+    403/AccessDenied 视为不存在：只写权限的桶（如华为云 OBS 交付桶）无法读取，
+    存在性无从判断，按"不存在"放行，由后续实际操作自行成败。
+    """
     try:
         client.head_object(Bucket=bucket_name, Key=object_key)
         return True
     except ClientError as exc:
         code = str(exc.response.get("Error", {}).get("Code", ""))
         if code in ("404", "NoSuchKey", "NotFound"):
+            return False
+        if code in ("403", "AccessDenied", "Forbidden"):
             return False
         raise
 
@@ -1032,7 +1050,14 @@ def verify_object(object_key: str, size: int, client=None, bucket_name: str | No
         default_client, default_name = _default_client_and_name()
         client = client or default_client
         bucket_name = bucket_name or default_name
-    meta = client.head_object(Bucket=bucket_name, Key=object_key)
+    try:
+        meta = client.head_object(Bucket=bucket_name, Key=object_key)
+    except ClientError as exc:
+        # 只写权限的桶无法读取做核对（上传本身已成功），跳过校验不算失败
+        code = str(exc.response.get("Error", {}).get("Code", ""))
+        if code in ("403", "AccessDenied", "Forbidden"):
+            return
+        raise
     actual = int(meta["ContentLength"])
     if actual != size:
         raise OSError(f"上传校验失败：bucket 中 {actual} 字节，本地 {size} 字节")
@@ -1700,7 +1725,13 @@ def check_bucket_health(client, bucket_name: str, endpoint: str, addressing: str
         result["ok"] = True
     except (BotoCoreError, ClientError) as exc:
         result["ok"] = False
-        result["error"] = str(exc)
+        code = str(exc.response.get("Error", {}).get("Code", "")) if isinstance(exc, ClientError) else ""
+        if code in ("403", "AccessDenied", "Forbidden"):
+            # 只写权限的桶（如华为云 OBS 交付桶）：可达但无读权限，不是连通性问题
+            result["error"] = "桶可达，但该 AK 无读权限（403，只写桶属正常，上传不受影响）"
+            result["status_code"] = 403
+        else:
+            result["error"] = str(exc)
         return result  # 连不通则不再查询其它字段
 
     # get_bucket_location
@@ -3381,6 +3412,7 @@ def api_bucket_health():
             "bucket_name": b["bucket_name"],
             "legacy_key": b.get("legacy_key"),
             "is_default": bool(b["is_default"]),
+            "signature_version": b.get("signature_version") or "s3v4",
             "health": health,
         })
     return jsonify(result)
@@ -3588,6 +3620,7 @@ def _bucket_public_row(b: dict) -> dict:
         "endpoint": b.get("endpoint"),
         "region": b.get("region"),
         "addressing_style": b.get("addressing_style") or "auto",
+        "signature_version": b.get("signature_version") or "s3v4",
         "legacy_key": b.get("legacy_key"),
         "is_default": bool(b["is_default"]),
         "enabled": bool(b["enabled"]),
@@ -3610,7 +3643,8 @@ def api_create_bucket():
     """新增桶。
 
     请求体 JSON：name, bucket_name, application_key_id, application_key（必填）；
-    endpoint / region / addressing_style(auto|virtual|path) / sort_order / is_default（可选）。
+    endpoint / region / addressing_style(auto|virtual|path) /
+    signature_version(s3v4|s3) / sort_order / is_default（可选）。
     首个桶强制为默认桶；设默认则同事务清掉其它桶的 is_default。
     """
     if not apikey_ok():
@@ -3629,6 +3663,9 @@ def api_create_bucket():
     addressing = (body.get("addressing_style") or "auto").strip()
     if addressing not in ("auto", "virtual", "path"):
         return jsonify({"error": "addressing_style 仅支持 auto/virtual/path"}), 400
+    signature = (body.get("signature_version") or "s3v4").strip()
+    if signature not in ("s3", "s3v4"):
+        return jsonify({"error": "signature_version 仅支持 s3v4/s3"}), 400
     try:
         sort_order = int(body.get("sort_order") or 0)
     except (TypeError, ValueError):
@@ -3642,8 +3679,8 @@ def api_create_bucket():
             conn.execute("UPDATE buckets SET is_default=0 WHERE is_default=1")
         cursor = conn.execute(
             "INSERT INTO buckets (name, bucket_name, application_key_id, application_key, "
-            "endpoint, region, addressing_style, is_default, enabled, sort_order, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
+            "endpoint, region, addressing_style, signature_version, is_default, enabled, sort_order, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
             (
                 name,
                 bucket_name,
@@ -3652,6 +3689,7 @@ def api_create_bucket():
                 (body.get("endpoint") or "").strip() or None,
                 (body.get("region") or "").strip() or None,
                 addressing,
+                signature,
                 is_default,
                 sort_order,
                 now,
@@ -3699,6 +3737,12 @@ def api_update_bucket(bucket_id: int):
                 return jsonify({"error": "addressing_style 仅支持 auto/virtual/path"}), 400
             sets.append("addressing_style=?")
             values.append(addressing)
+        if "signature_version" in body:
+            signature = (body.get("signature_version") or "s3v4").strip()
+            if signature not in ("s3", "s3v4"):
+                return jsonify({"error": "signature_version 仅支持 s3v4/s3"}), 400
+            sets.append("signature_version=?")
+            values.append(signature)
         if "sort_order" in body:
             try:
                 sets.append("sort_order=?")

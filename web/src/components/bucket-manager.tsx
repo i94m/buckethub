@@ -54,6 +54,11 @@ const ADDRESSING_OPTIONS = [
   { value: "path", label: "path（路径）" },
 ]
 
+const SIGNATURE_OPTIONS = [
+  { value: "s3v4", label: "s3v4（AWS V4，默认）" },
+  { value: "s3", label: "s3（V2，华为云 OBS）" },
+]
+
 /** 连通性一栏的展示。 */
 function TestState({ entry, testing }: { entry: BucketHealthEntry | undefined; testing: boolean }) {
   if (testing) return <span className="text-xs text-muted-foreground">测试中…</span>
@@ -358,6 +363,7 @@ function BucketForm({
     endpoint: initial?.endpoint ?? "",
     region: initial?.region ?? "",
     addressing_style: initial?.addressing_style ?? "auto",
+    signature_version: initial?.signature_version ?? "s3v4",
     sort_order: String(initial?.sort_order ?? defaultSortOrder),
     is_default: initial?.is_default ?? false,
     enabled: initial?.enabled ?? true,
@@ -401,6 +407,7 @@ function BucketForm({
           endpoint: form.endpoint.trim(),
           region: form.region.trim(),
           addressing_style: form.addressing_style,
+          signature_version: form.signature_version,
           sort_order: Number(form.sort_order) || 0,
           is_default: form.is_default,
           enabled: form.enabled,
@@ -415,6 +422,7 @@ function BucketForm({
           endpoint: form.endpoint.trim() || undefined,
           region: form.region.trim() || undefined,
           addressing_style: form.addressing_style,
+          signature_version: form.signature_version,
           sort_order: Number(form.sort_order) || 0,
           is_default: form.is_default,
         })
@@ -498,7 +506,7 @@ function BucketForm({
             />
           </div>
         </div>
-        <div className="grid grid-cols-2 gap-4">
+        <div className="grid grid-cols-3 gap-4">
           <div className="space-y-2">
             <Label>寻址风格</Label>
             <Select
@@ -510,6 +518,24 @@ function BucketForm({
               </SelectTrigger>
               <SelectContent>
                 {ADDRESSING_OPTIONS.map((o) => (
+                  <SelectItem key={o.value} value={o.value}>
+                    {o.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="space-y-2">
+            <Label>签名版本</Label>
+            <Select
+              value={form.signature_version}
+              onValueChange={(v) => set("signature_version", v)}
+            >
+              <SelectTrigger className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {SIGNATURE_OPTIONS.map((o) => (
                   <SelectItem key={o.value} value={o.value}>
                     {o.label}
                   </SelectItem>
