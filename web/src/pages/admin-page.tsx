@@ -277,7 +277,7 @@ function AdminPage() {
                 >
                   <Cloud className="size-4" /> 存储桶
                 </NavigationMenuTrigger>
-                <NavigationMenuContent className="w-[11rem] p-1">
+                <NavigationMenuContent className="w-[11rem] p-1 z-50">
                   <ul className="grid gap-1">
                     {enabledBuckets.length === 0 && (
                       <li className="px-2 py-1.5 text-xs text-muted-foreground">
