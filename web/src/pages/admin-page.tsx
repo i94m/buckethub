@@ -31,6 +31,7 @@ import { FetchUrlDialog } from "@/components/action-dialogs"
 import { ConnectionStatus, JobsTable } from "@/components/job-status-bar"
 import { ServerFilesSection } from "@/components/server-files-section"
 import { ProcessSection } from "@/components/process-section"
+import { type ProcessJobLite } from "@/components/process-cell"
 import { BucketBrowserSection } from "@/components/bucket-browser-section"
 import { BucketManager } from "@/components/bucket-manager"
 import { DatasourceManager } from "@/components/datasource-manager"
@@ -46,7 +47,7 @@ function AdminPage() {
   const bucketPrivate = appInfo?.bucket_private ?? null
 
   // 数据处理任务数（导航徽标用）
-  const [processJobs, setProcessJobs] = React.useState<{ id: number; status: string }[]>([])
+  const [processJobs, setProcessJobs] = React.useState<ProcessJobLite[]>([])
   const activeProcessJobs = processJobs.filter((j) =>
     ["queued", "running", "cancelling"].includes(j.status)
   ).length
@@ -350,6 +351,7 @@ function AdminPage() {
               data={files}
               scripts={scripts}
               buckets={buckets}
+              processJobs={processJobs}
               total={total}
               page={page}
               pageSize={pageSize}

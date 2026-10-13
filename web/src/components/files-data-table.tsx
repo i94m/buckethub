@@ -78,6 +78,7 @@ import { Skeleton } from "@/components/ui/skeleton"
 import { NumberPagination } from "@/components/number-pagination"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { CopyButton } from "@/components/ui/copy-button"
+import { ProcessCell, type ProcessJobLite } from "@/components/process-cell"
 
 /** 骨架行各列的宽度类（按 columns 顺序对齐，模拟真实数据宽度）。 */
 function skeletonWidths(bucketCount: number): string[] {
@@ -89,6 +90,7 @@ function skeletonWidths(bucketCount: number): string[] {
     "w-32",   // ObjectKey
     "w-20",   // 大小（居中）
     "w-16",   // 本地
+    "w-16",   // 清洗
   ]
   for (let i = 0; i < bucketCount; i++) widths.push("w-16") // 各桶列
   widths.push("w-24", "w-8") // 创建时间、操作
@@ -107,6 +109,8 @@ interface FilesDataTableProps {
   onPageChange: (page: number) => void
   onDeleted: () => void
   onFileUpdated?: (file: FileItem) => void
+  /** 数据处理任务列表（清洗列状态来源）。 */
+  processJobs?: ProcessJobLite[]
 }
 
 /** 截断长文本 + tooltip 显示完整值。 */
@@ -822,7 +826,8 @@ export function FilesDataTable({
   onPageChange,
   onDeleted,
   onFileUpdated,
-}: FilesDataTableProps) {
+  processJobs = [],
+}: FilesDataTableProps & { processJobs?: ProcessJobLite[] }) {
   const datasourceName = React.useMemo(() => {
     const map = new Map<number, string>()
     scripts.forEach((s) => map.set(s.id, s.name))
@@ -927,6 +932,18 @@ export function FilesDataTable({
           id: "local",
           header: () => <div className="min-w-[4rem] text-center">本地</div>,
           cell: ({ row }) => <div className="flex justify-center"><LocalCell file={row.original} onUpdated={onDeleted} onFileUpdated={onFileUpdated} /></div>,
+        },
+        {
+          id: "process",
+          header: () => <div className="min-w-[4rem] text-center">清洗</div>,
+          cell: ({ row }) => (
+            <div className="flex justify-center">
+              <ProcessCell
+                filePath={row.original.local_path ?? ""}
+                jobs={processJobs}
+              />
+            </div>
+          ),
         },
       ]
       enabledBuckets.forEach((bucket) => {
