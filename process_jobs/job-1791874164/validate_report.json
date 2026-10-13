@@ -1,0 +1,72 @@
+{
+  "validator": "normalized B-class JSONL structural validator",
+  "input": "/opt/b2-file-manager/process_jobs/job-1791874164/converted.jsonl",
+  "passed_output": "/opt/b2-file-manager/process_jobs/job-1791874164/passed.jsonl",
+  "duplicate_run_ids_ignored": true,
+  "scope_note": "Automated structural and aggregate checks only; semantic correctness, artifact existence, sensitive-information safety, and human quality review are not assessed.",
+  "total_rows": 3,
+  "parsed_rows": 3,
+  "structurally_valid_rows": 3,
+  "structural_pass_rate": 1.0,
+  "unique_run_ids": 3,
+  "error_counts": {},
+  "stats_only_counts": {},
+  "content_quality_rate_gates": {
+    "multiturn_valid_pct": 100.0,
+    "tool_presence_pct": 100.0,
+    "final_answer_complete_pct": 100.0,
+    "context_dependency_pct_among_multiturn": 100.0
+  },
+  "error_examples": [],
+  "model_distribution": {
+    "claude-opus-5": 3
+  },
+  "turn_count_distribution": {
+    "2": 3
+  },
+  "source_stop_reason_distribution": {
+    "None": 3
+  },
+  "tool_metrics": {
+    "unique_tool_names": 1,
+    "unique_services": 1,
+    "total_calls": 3,
+    "status_distribution": {
+      "success": 3
+    },
+    "success_rate": 1.0,
+    "used_by_later_steps_true_calls": 3,
+    "used_by_later_steps_rate": 1.0
+  },
+  "trajectory_metrics": {
+    "multi_service_trajectories": 0,
+    "multi_service_rate": 0.0,
+    "single_service_trajectories_by_service": {
+      "terminal": 3
+    },
+    "largest_single_service_as_only_source": "terminal",
+    "largest_single_service_as_only_source_count": 3,
+    "largest_single_service_as_only_source_rate": 1.0,
+    "informational_note": "源批次构成指标（多轮率/依赖率/单服务集中度）为信息性统计，不设门；交付集逐条已满足 B 类多轮标准",
+    "context_dependency_proxy_trajectories": 3,
+    "context_dependency_proxy_rate": 1.0,
+    "change_or_correction_trajectories": 3,
+    "change_or_correction_rate": 1.0,
+    "failed_or_timeout_with_later_use_trajectories": 0,
+    "failed_or_timeout_with_later_use_rate": 0.0
+  },
+  "automated_requirement_checks": {
+    "jsonl_parse_rate_100pct": true,
+    "schema_structural_conformance_rate_100pct": true,
+    "unique_run_id_rate_100pct": true,
+    "model_allowlist_rate_100pct": true,
+    "delivered_multiturn_rate_100pct": true,
+    "delivered_context_dependency_rate_100pct": true,
+    "delivered_tool_call_presence_100pct": true,
+    "tool_result_use_rate_at_least_90pct": true,
+    "tool_call_success_rate_at_least_90pct": true,
+    "at_least_15_tool_names": false,
+    "change_or_correction_trajectory_rate_at_least_5pct": true
+  },
+  "all_automated_checks_passed": false
+}

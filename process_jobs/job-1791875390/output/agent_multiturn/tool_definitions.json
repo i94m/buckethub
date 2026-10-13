@@ -1,0 +1,43 @@
+{
+  "tool_count": 2,
+  "tools": [
+    {
+      "service": "terminal",
+      "name": "bash",
+      "description": "run shell",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "cmd": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "cmd"
+        ]
+      }
+    },
+    {
+      "service": "filesystem",
+      "name": "read_file",
+      "description": "read file",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    }
+  ],
+  "mcp_service_enum": [
+    "terminal"
+  ],
+  "service_call_counts": {
+    "terminal": 3
+  }
+}

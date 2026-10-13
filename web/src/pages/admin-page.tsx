@@ -1,5 +1,5 @@
 import * as React from "react"
-import { ArrowUpDown, Cloud, FolderOpen, HardDrive, RefreshCw, Search } from "lucide-react"
+import { ArrowUpDown, Cloud, FolderOpen, HardDrive, RefreshCw, Search, Workflow } from "lucide-react"
 
 import { type BucketHealthEntry, type Datasource, type FileItem } from "@/lib/types"
 import { getBucketHealth, getFiles, getScripts } from "@/lib/api"
@@ -30,6 +30,7 @@ import { FilesDataTable } from "@/components/files-data-table"
 import { FetchUrlDialog } from "@/components/action-dialogs"
 import { ConnectionStatus, JobsTable } from "@/components/job-status-bar"
 import { ServerFilesSection } from "@/components/server-files-section"
+import { ProcessSection } from "@/components/process-section"
 import { BucketBrowserSection } from "@/components/bucket-browser-section"
 import { BucketManager } from "@/components/bucket-manager"
 import { DatasourceManager } from "@/components/datasource-manager"
@@ -43,6 +44,31 @@ function AdminPage() {
   const defaultPrefix = appInfo?.default_prefix ?? ""
   const bucketPrivateNote = appInfo?.bucket_private_note ?? ""
   const bucketPrivate = appInfo?.bucket_private ?? null
+
+  // 数据处理任务数（导航徽标用）
+  const [processJobs, setProcessJobs] = React.useState<{ id: number; status: string }[]>([])
+  const activeProcessJobs = processJobs.filter((j) =>
+    ["queued", "running", "cancelling"].includes(j.status)
+  ).length
+  React.useEffect(() => {
+    let stop = false
+    async function load() {
+      try {
+        const res = await fetch("/api/process/jobs", {
+          headers: { "X-API-Key": new URLSearchParams(window.location.search).get("apikey") ?? "" },
+        })
+        if (res.ok && !stop) setProcessJobs(await res.json())
+      } catch {
+        /* ignore */
+      }
+    }
+    load()
+    const t = setInterval(load, 5000)
+    return () => {
+      stop = true
+      clearInterval(t)
+    }
+  }, [])
 
   // 桶连通性：导航菜单内状态点 + hover 详情共用
   const [healthMap, setHealthMap] = React.useState<Record<number, BucketHealthEntry>>({})
@@ -222,6 +248,21 @@ function AdminPage() {
                 <button
                   type="button"
                   className={navigationMenuTriggerStyle({ className: "gap-1.5 px-3" })}
+                  data-active={section === "process"}
+                  onClick={() => setSection("process")}
+                >
+                  <Workflow className="size-4" /> 数据处理
+                  {activeProcessJobs > 0 && (
+                    <span className="text-[10px] tabular-nums text-muted-foreground">
+                      {activeProcessJobs}
+                    </span>
+                  )}
+                </button>
+              </NavigationMenuItem>
+              <NavigationMenuItem>
+                <button
+                  type="button"
+                  className={navigationMenuTriggerStyle({ className: "gap-1.5 px-3" })}
                   data-active={section === "local"}
                   onClick={() => setSection("local")}
                 >
@@ -322,6 +363,11 @@ function AdminPage() {
           {/* 上传管理：传输列表（上传/下载任务全宽） */}
           <TabsContent value="transfers">
             <JobsTable />
+          </TabsContent>
+
+          {/* 数据处理：B 类流水线（转换→质检→选最长→脱敏→打包） */}
+          <TabsContent value="process">
+            <ProcessSection />
           </TabsContent>
 
           {/* 本地文件：服务器文件目录 */}

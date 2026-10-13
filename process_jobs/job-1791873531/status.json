@@ -1,0 +1,26 @@
+{
+  "stages": [
+    {
+      "name": "convert",
+      "status": "done"
+    },
+    {
+      "name": "validate",
+      "status": "done"
+    },
+    {
+      "name": "keep_longest",
+      "status": "done"
+    },
+    {
+      "name": "redact",
+      "status": "running"
+    },
+    {
+      "name": "package",
+      "status": "pending"
+    }
+  ],
+  "progress": 75.0,
+  "updated_at": "2026-10-13T06:38:55Z"
+}
