@@ -17,26 +17,14 @@ import time
 from collections import Counter
 from pathlib import Path
 
+from redact import redact_walk, sensitive_hits  # 单一规则源
+
 STAGES = ["convert", "validate", "keep_longest", "redact", "package"]
 WEIGHTS = {"convert": 0.30, "validate": 0.30, "keep_longest": 0.15, "redact": 0.15, "package": 0.10}
 PIPELINE_DIR = Path(__file__).resolve().parent
 BATCH_ID_TEXT = "PROCESS-" + time.strftime("%Y%m%d")
 
-REDACTIONS = [
-    ("private_key_block", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"), None),
-    ("aws_access_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b"), None),
-    ("api_key_sk", re.compile(r"\b(?:sk|rk|pk)-[A-Za-z0-9_-]{16,}"), None),
-    ("github_token", re.compile(r"\b(?:ghp|github_pat|xox[baprs])_[A-Za-z0-9_-]{12,}"), None),
-    ("google_api_key", re.compile(r"\bAIza[0-9A-Za-z_\-]{35}"), None),
-    ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"), None),
-    ("kv_secret", re.compile(r'(?i)\b(?:api[_-]?key|secret|password|passwd|cookie|authorization)\s*[:=]\s*["\']?([A-Za-z0-9_./+\-=]{8,})'), 1),
-    ("email", re.compile(r"(?<![\w.+-])[\w.+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"), None),
-    ("cn_mobile", re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)"), None),
-    ("cn_id_card", re.compile(r"(?<!\d)\d{17}[0-9Xx](?!\d)"), None),
-    ("posix_abs_path", re.compile(r"(?<!\w)/(?:Users|home|var|private)/[^\s\"'<>]+"), None),
-    ("win_drive_path", re.compile(r"(?i)\b[A-Z]:\\[^\s\"'<>]+"), None),
-    ("private_ip", re.compile(r"(?<!\d)(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})(?!\d)"), None),
-]
+REDACTIONS = None  # 规则单一源见 redact.py
 
 WRAPPER = re.compile(
     r"<(?:system-reminder|task-notification|ide_opened_file|ide_selection|"
@@ -199,7 +187,7 @@ def main():
                 dst_fh.write(line)
                 continue
             before = json.dumps(rec, ensure_ascii=False, sort_keys=True)
-            redact_walk(rec, "record")
+            redact_walk(rec, rec.get("run_id", "?"))
             after = json.dumps(rec, ensure_ascii=False, sort_keys=True)
             if after != before:
                 red_rows += 1
@@ -298,31 +286,8 @@ def main():
     log(f"=== JOB DONE: output={out} ===")
 
 
-def redact_walk(node, log_ctx):
-    if isinstance(node, list):
-        for i, item in enumerate(node):
-            if isinstance(item, str):
-                node[i] = redact_string(item)
-            else:
-                redact_walk(item, log_ctx)
-    elif isinstance(node, dict):
-        for key in list(node.keys()):
-            val = node[key]
-            if isinstance(val, str):
-                node[key] = redact_string(val)
-            else:
-                redact_walk(val, log_ctx)
 
 
-def redact_string(text):
-    out = text
-    for _, pattern, group in REDACTIONS:
-        def _sub(m, _p=pattern, _g=group):
-            if _g is None:
-                return "[[REDACTED]]"
-            return m.group(0).replace(m.group(_g), "[[REDACTED]]")
-        out = pattern.sub(_sub, out)
-    return out
 
 
 if __name__ == "__main__":

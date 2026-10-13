@@ -1,0 +1,28 @@
+{
+  "stages": [
+    {
+      "name": "convert",
+      "status": "done"
+    },
+    {
+      "name": "validate",
+      "status": "done"
+    },
+    {
+      "name": "keep_longest",
+      "status": "done"
+    },
+    {
+      "name": "redact",
+      "status": "done"
+    },
+    {
+      "name": "package",
+      "status": "done"
+    }
+  ],
+  "progress": 100.0,
+  "updated_at": "2026-10-13T09:57:00Z",
+  "records": 3,
+  "shards": 1
+}

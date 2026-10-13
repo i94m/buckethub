@@ -1,0 +1,20 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "agent_multiturn.schema.json",
+  "title": "B-class agent_multiturn normalized record",
+  "version": "1.0",
+  "batch_id": "PROCESS-20261013",
+  "type": "object",
+  "required": [
+    "run_id",
+    "data_type",
+    "language",
+    "initial_instruction",
+    "model",
+    "tools_available",
+    "messages",
+    "turn_count",
+    "tool_calls",
+    "final_answer"
+  ]
+}

@@ -1,0 +1,28 @@
+{
+  "batch": {
+    "record_count": 3,
+    "pipeline": "PROCESS-20261013 convert -> validate -> keep-longest -> redact -> package",
+    "generated_at_utc": "2026-10-13T09:57:00Z"
+  },
+  "statistics": {
+    "total_turns": 6,
+    "total_tool_calls": 3,
+    "unique_tool_names": 1,
+    "correction_trajectories": 3,
+    "language_distribution": {
+      "zh-CN": 3
+    },
+    "model_distribution": {
+      "claude-opus-5": 3
+    }
+  },
+  "shards": [
+    {
+      "file": "/opt/b2-file-manager/process_jobs/job-1791885415/output/agent_multiturn/part-00001.jsonl",
+      "bytes": 4929,
+      "records": 3
+    }
+  ],
+  "kept_sessions": 3,
+  "redacted_rows": 0
+}
