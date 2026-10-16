@@ -17,6 +17,11 @@ import time
 from collections import Counter
 from pathlib import Path
 
+try:
+    import resource
+except ImportError:  # pragma: no cover - non-POSIX
+    resource = None
+
 from redact import redact_walk, sensitive_hits  # 单一规则源
 
 STAGES = ["convert", "validate", "keep_longest", "redact", "package"]
@@ -71,6 +76,33 @@ def check_cancel(job_dir):
     return (Path(job_dir) / "cancel.flag").exists()
 
 
+def raise_fd_limit() -> None:
+    """Raise RLIMIT_NOFILE so large source dirs don't hit Errno 24.
+
+    The convert/validate stages run as child processes and inherit this limit.
+    Paired with the converter's bounded file-handle LRU this keeps descriptor
+    use safe on 100k+ file inputs (previously: one handle per input file).
+    """
+    if resource is None:
+        return
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except (ValueError, OSError):
+        return
+    if hard == resource.RLIM_INFINITY:
+        target_hard = resource.RLIM_INFINITY
+        target_soft = 61440  # macOS caps per-process opens; ask for the usual max
+    else:
+        target_hard = hard
+        target_soft = hard
+    if target_soft > soft:
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target_soft, target_hard))
+            log(f"raised RLIMIT_NOFILE {soft} -> {target_soft}")
+        except (ValueError, OSError) as exc:
+            log(f"could not raise RLIMIT_NOFILE ({exc}); continuing at {soft}")
+
+
 def run_cmd(cmd, job_dir, stage_idx, stage_name, total_hint=None, count_file=None,
             ok_codes=(0,)):
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -100,6 +132,7 @@ def run_cmd(cmd, job_dir, stage_idx, stage_name, total_hint=None, count_file=Non
 
 
 def main():
+    raise_fd_limit()
     ap = argparse.ArgumentParser()
     ap.add_argument("--job-dir", required=True)
     ap.add_argument("--source", required=True)

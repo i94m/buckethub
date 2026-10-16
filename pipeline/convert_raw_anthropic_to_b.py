@@ -26,7 +26,7 @@ import hashlib
 import json
 import re
 import sys
-from collections import Counter
+from collections import Counter, OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Iterator
@@ -628,8 +628,43 @@ def scan_records(
     return selected
 
 
-def read_locator(handles: list[Any], locator: Locator) -> dict[str, Any]:
-    handle = handles[locator.file_index]
+class _FileHandleCache:
+    """Bounded LRU of open input file handles, keyed by file index.
+
+    ``convert_files`` used to open *every* input file at once
+    (``handles = [path.open("rb") for path in paths]``). On large source
+    directories that exhausts ``RLIMIT_NOFILE`` / ``kern.maxfiles`` and aborts
+    with ``OSError: [Errno 24] Too many open files`` (observed on a 119,769-file
+    batch). ``selected`` is consumed in ascending ``locator.ordinal`` order,
+    i.e. mostly file-index order, so a small LRU keeps the output byte-for-byte
+    identical while capping concurrent descriptors at ``max_open``.
+    """
+
+    def __init__(self, paths: list[Path], max_open: int = 512) -> None:
+        self._paths = paths
+        self._max_open = max(1, max_open)
+        self._handles: "OrderedDict[int, Any]" = OrderedDict()
+
+    def get(self, index: int) -> Any:
+        handle = self._handles.get(index)
+        if handle is not None:
+            self._handles.move_to_end(index)
+            return handle
+        if len(self._handles) >= self._max_open:
+            _, evicted = self._handles.popitem(last=False)
+            evicted.close()
+        handle = self._paths[index].open("rb")
+        self._handles[index] = handle
+        return handle
+
+    def close(self) -> None:
+        for handle in self._handles.values():
+            handle.close()
+        self._handles.clear()
+
+
+def read_locator(handles: "_FileHandleCache", locator: Locator) -> dict[str, Any]:
+    handle = handles.get(locator.file_index)
     handle.seek(locator.byte_offset)
     row = json.load(handle) if locator.whole_file else json.loads(handle.readline())
     if not isinstance(row, dict):
@@ -676,7 +711,7 @@ def convert_files(args: argparse.Namespace) -> dict[str, Any]:
 
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_name(output.name + ".tmp")
-    handles = [path.open("rb") for path in paths]
+    handles = _FileHandleCache(paths, getattr(args, "max_open_files", 512))
     try:
         with temporary.open("w", encoding="utf-8", newline="\n") as destination:
             for session_id, locator in selected:
@@ -716,8 +751,7 @@ def convert_files(args: argparse.Namespace) -> dict[str, Any]:
                     sole_service[services[0]] += 1
         temporary.replace(output)
     finally:
-        for handle in handles:
-            handle.close()
+        handles.close()
         temporary.unlink(missing_ok=True)
 
     converted = len(converted_stats)
@@ -802,6 +836,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=30,
         help="maximum rejection examples in report (default: 30)",
     )
+    parser.add_argument(
+        "--max-open-files",
+        type=int,
+        default=512,
+        help=(
+            "cap on simultaneously open input files; large source directories are "
+            "read through a bounded LRU so the FD limit is never exhausted "
+            "(default: 512)"
+        ),
+    )
     return parser
 
 
@@ -809,6 +853,9 @@ def main() -> int:
     args = build_parser().parse_args()
     if args.max_result_summary_chars < 0 or args.max_examples < 0:
         print("numeric options must be non-negative", file=sys.stderr)
+        return 2
+    if args.max_open_files < 1:
+        print("--max-open-files must be >= 1", file=sys.stderr)
         return 2
     try:
         report = convert_files(args)
