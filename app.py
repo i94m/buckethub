@@ -4273,6 +4273,9 @@ def api_update_file(file_id: int):
         if status_val in ("pending", "processing", "processed", "synced", "failed", "deleted", "cancelled"):
             fields.append("status = ?")
             params.append(status_val)
+            # 状态置为 synced 时落 synced_at（旧流程由 b_synced 直接补列；接口版补上）
+            if status_val == "synced":
+                fields.append("synced_at = UNIX_TIMESTAMP()")
 
     # datasource_id 可空整数
     if "datasource_id" in body:
