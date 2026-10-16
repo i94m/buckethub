@@ -500,7 +500,9 @@ def convert_record(
     stats = {
         "model": model,
         "tool_names": sorted(used_names),
-        "services": sorted({row["mcp_service"] for row in tool_rows}),
+        "services": sorted(
+            {row["mcp_service"] for row in tool_rows if row["mcp_service"] is not None}
+        ),
         "tool_calls": len(tool_rows),
         "successful_tool_calls": successful_calls,
         "has_change": any(CHANGE_MARKERS.search(text) for text in user_texts[1:]),
