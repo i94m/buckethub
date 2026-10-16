@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -131,11 +132,129 @@ def run_cmd(cmd, job_dir, stage_idx, stage_name, total_hint=None, count_file=Non
     return rc
 
 
+def source_files(source: Path) -> list:
+    source = source.resolve()
+    if source.is_dir():
+        return sorted([*source.glob("*.json"), *source.glob("*.jsonl")])
+    return [source] if source.exists() else []
+
+
+def run_parallel(cmds, job_dir, stage_idx, stage_name, ok_codes=(0,)):
+    """Run commands concurrently, polling cancel; return [(rc, stderr)]."""
+    procs = [subprocess.Popen(c, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+             for c in cmds]
+    while any(p.poll() is None for p in procs):
+        if check_cancel(job_dir):
+            for p in procs:
+                p.terminate()
+            write_status_error(job_dir, stage_idx, "已取消")
+            sys.exit(3)
+        done = sum(1 for p in procs if p.poll() is not None)
+        write_status(job_dir, stage_idx, "running", done / len(procs))
+        time.sleep(2)
+    out = [(p.returncode,
+            (p.stderr.read().decode("utf-8", "replace") if p.stderr else ""))
+           for p in procs]
+    bad = [(rc, err) for rc, err in out if rc not in ok_codes]
+    if bad:
+        log(f"{stage_name} failed rc={bad[0][0]}: {bad[0][1][-400:]}")
+        write_status_error(job_dir, stage_idx, f"{stage_name} 失败: {bad[0][1][-300:]}")
+        sys.exit(1)
+    return out
+
+
+def interleaved_convert_validate(job_dir, source, args):
+    """(A) convert -> validate per chunk, deleting each chunk's source immediately.
+
+    Peak disk ~= src + chunk_workers*chunk_conv + passed_so_far, instead of
+    src + full_conv (which needs >150G on a ~119k-file batch). Per-chunk selection
+    is still collapsed globally by the keep-longest (run_id) stage, matching the
+    existing flow. Returns (conv_rows, qc_rows, passed_files).
+    """
+    files = source_files(source)
+    if not files:
+        raise ValueError(f"no JSON/JSONL input files under {source}")
+    n = max(1, min(args.chunk_count, len(files)))
+    w = max(1, args.chunk_workers)
+    chunks = [files[i::n] for i in range(n)]  # round-robin (order-preserving)
+    conv_dir = job_dir / "conv"
+    passed_dir = job_dir / "passed"
+    link_root = job_dir / "chunks"
+    for d in (conv_dir, passed_dir, link_root):
+        d.mkdir(parents=True, exist_ok=True)
+    conv_bin = str(PIPELINE_DIR / "convert_raw_anthropic_to_b.py")
+    val_bin = str(PIPELINE_DIR / "validate_normalized_b.py")
+    conv_rows = qc_rows = freed_files = 0
+    passed_files = []
+    for w0 in range(0, n, w):
+        wave = list(range(w0, min(w0 + w, n)))
+        chunk_dirs = {}
+        for i in wave:
+            d = link_root / f"w{i:03d}"
+            d.mkdir(parents=True, exist_ok=True)
+            for f in chunks[i]:
+                dst = d / f.name
+                if not dst.exists():
+                    os.symlink(f, dst)
+            chunk_dirs[i] = d
+        run_parallel(
+            [[sys.executable, conv_bin, str(chunk_dirs[i]),
+              "-o", str(conv_dir / f"w{i:03d}.jsonl"),
+              "--dedupe-session-id", "--max-open-files", str(args.max_open_files)]
+             for i in wave],
+            job_dir, 0, f"转换(片{wave[0]}-{wave[-1]})")
+        run_parallel(
+            [[sys.executable, val_bin, str(conv_dir / f"w{i:03d}.jsonl"),
+              "--report", str(passed_dir / f"w{i:03d}.report.json"),
+              "--passed-output", str(passed_dir / f"w{i:03d}.passed.jsonl"),
+              "--allow-duplicate-run-id"]
+             for i in wave],
+            job_dir, 1, f"质检(片{wave[0]}-{wave[-1]})", ok_codes=(0, 1))
+        for i in wave:
+            co = conv_dir / f"w{i:03d}.jsonl"
+            po = passed_dir / f"w{i:03d}.passed.jsonl"
+            if co.exists():
+                conv_rows += sum(1 for _ in co.open("rb"))
+            if po.exists():
+                qc_rows += sum(1 for _ in po.open("rb"))
+                passed_files.append(po)
+            co.unlink(missing_ok=True)
+            for f in chunks[i]:
+                try:
+                    f.unlink()  # free this chunk's source immediately
+                    freed_files += 1
+                except OSError:
+                    pass
+            shutil.rmtree(chunk_dirs[i], ignore_errors=True)
+            chunks[i] = []
+        log(f"--interleave wave {wave[0]}-{wave[-1]} done: conv={conv_rows} "
+            f"qc={qc_rows} freed_src={freed_files}")
+    log(f"--interleave done: conv_rows={conv_rows} qc_rows={qc_rows} "
+        f"freed_src_files={freed_files}")
+    return conv_rows, qc_rows, passed_files
+
+
 def main():
     raise_fd_limit()
     ap = argparse.ArgumentParser()
     ap.add_argument("--job-dir", required=True)
     ap.add_argument("--source", required=True)
+    ap.add_argument(
+        "--interleave",
+        action="store_true",
+        help=(
+            "large batches: convert+validate the source in chunks and delete each "
+            "chunk's source files as soon as that chunk is converted, bounding peak "
+            "disk to ~src + chunk_workers*chunk_conv instead of src + full_conv "
+            "(default: off, original single-pass behaviour)"
+        ),
+    )
+    ap.add_argument("--chunk-count", type=int, default=16,
+                    help="number of chunks for --interleave (default: 16)")
+    ap.add_argument("--chunk-workers", type=int, default=4,
+                    help="chunks converted/validated concurrently for --interleave (default: 4)")
+    ap.add_argument("--max-open-files", type=int, default=512,
+                    help="open-file cap passed to the converter (default: 512)")
     args = ap.parse_args()
     job_dir = Path(args.job_dir).resolve()
     job_dir.mkdir(parents=True, exist_ok=True)
@@ -159,43 +278,56 @@ def main():
     converted = job_dir / "converted.jsonl"
     passed = job_dir / "passed.jsonl"
 
-    # ---- Stage 1: 转换 ----
-    log("stage 1/5 转换 start")
-    run_cmd([sys.executable, str(PIPELINE_DIR / "convert_raw_anthropic_to_b.py"),
-             str(source), "-o", str(converted), "--dedupe-session-id"],
-            job_dir, 0, "转换", total_hint, converted)
-    conv_rows = sum(1 for _ in converted.open("rb")) if converted.exists() else 0
-    log(f"stage 1/5 转换 done: {conv_rows} rows")
+    if args.interleave:
+        # ---- Stages 1+2 (A): 逐片 转换→质检→删源 ----
+        log("stage 1-2/5 转换+质检（--interleave：逐片闭环、完成即删该片源码） start")
+        conv_rows, qc_rows, passed_files = interleaved_convert_validate(job_dir, source, args)
+        write_status(job_dir, 1, "done", 1.0)
+        log(f"stage 1-2/5 done: conv_rows={conv_rows} qc_rows={qc_rows} "
+            f"passed_files={len(passed_files)}")
+    else:
+        # ---- Stage 1: 转换 ----
+        log("stage 1/5 转换 start")
+        run_cmd([sys.executable, str(PIPELINE_DIR / "convert_raw_anthropic_to_b.py"),
+                 str(source), "-o", str(converted), "--dedupe-session-id",
+                 "--max-open-files", str(args.max_open_files)],
+                job_dir, 0, "转换", total_hint, converted)
+        conv_rows = sum(1 for _ in converted.open("rb")) if converted.exists() else 0
+        log(f"stage 1/5 转换 done: {conv_rows} rows")
 
-    # ---- Stage 2: 质检 ----
-    log("stage 2/5 质检 start")
-    run_cmd([sys.executable, str(PIPELINE_DIR / "validate_normalized_b.py"),
-             str(converted), "--report", str(job_dir / "validate_report.json"),
-             "--passed-output", str(passed), "--allow-duplicate-run-id"],
-            job_dir, 1, "质检", conv_rows or total_hint, passed, ok_codes=(0, 1))
-    qc_rows = sum(1 for _ in passed.open("rb")) if passed.exists() else 0
-    log(f"stage 2/5 质检 done: {qc_rows} rows passed")
+        # ---- Stage 2: 质检 ----
+        log("stage 2/5 质检 start")
+        run_cmd([sys.executable, str(PIPELINE_DIR / "validate_normalized_b.py"),
+                 str(converted), "--report", str(job_dir / "validate_report.json"),
+                 "--passed-output", str(passed), "--allow-duplicate-run-id"],
+                job_dir, 1, "质检", conv_rows or total_hint, passed, ok_codes=(0, 1))
+        qc_rows = sum(1 for _ in passed.open("rb")) if passed.exists() else 0
+        log(f"stage 2/5 质检 done: {qc_rows} rows passed")
+        passed_files = [passed]
 
     # ---- Stage 3: 选最长（同 run_id）----
     log("stage 3/5 选最长 start")
     write_status(job_dir, 2, "running", 0)
     best = {}
     removed = 0
-    with passed.open("rb") as fh:
-        for line in fh:
-            if check_cancel(job_dir):
-                write_status_error(job_dir, 2, "已取消")
-                sys.exit(3)
-            try:
-                rec = json.loads(line)
-                rid = rec.get("run_id") or hashlib.sha256(line[:2048]).hexdigest()[:16]
-            except Exception:
-                rid = hashlib.sha256(line[:2048]).hexdigest()[:16]
-            prev = best.get(rid)
-            if prev is None or len(line) > prev[0]:
-                best[rid] = (len(line), line)
-            else:
-                removed += 1
+    for _pf in passed_files:
+        if not _pf.exists():
+            continue
+        with _pf.open("rb") as fh:
+            for line in fh:
+                if check_cancel(job_dir):
+                    write_status_error(job_dir, 2, "已取消")
+                    sys.exit(3)
+                try:
+                    rec = json.loads(line)
+                    rid = rec.get("run_id") or hashlib.sha256(line[:2048]).hexdigest()[:16]
+                except Exception:
+                    rid = hashlib.sha256(line[:2048]).hexdigest()[:16]
+                prev = best.get(rid)
+                if prev is None or len(line) > prev[0]:
+                    best[rid] = (len(line), line)
+                else:
+                    removed += 1
     kept = job_dir / "kept.jsonl"
     with kept.open("wb") as out_fh:
         for rid in sorted(best):
