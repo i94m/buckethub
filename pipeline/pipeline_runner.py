@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import time
+import zipfile
 from collections import Counter
 from pathlib import Path
 
@@ -139,6 +140,20 @@ def source_files(source: Path) -> list:
     return [source] if source.exists() else []
 
 
+def _zip_entries(zip_path: Path) -> list:
+    """JSON/JSONL members of a source zip, in archive order."""
+    with zipfile.ZipFile(zip_path) as zf:
+        return [n for n in zf.namelist()
+                if not n.endswith("/") and n.lower().endswith((".json", ".jsonl"))]
+
+
+def _extract_member(zf, member: str, dest_dir: Path) -> None:
+    """Extract one archive member, flattened to its basename (streamed copy)."""
+    dest = dest_dir / os.path.basename(member)
+    with zf.open(member) as src, dest.open("wb") as out:
+        shutil.copyfileobj(src, out, 1024 * 1024)
+
+
 def run_parallel(cmds, job_dir, stage_idx, stage_name, ok_codes=(0,)):
     """Run commands concurrently, polling cancel; return [(rc, stderr)]."""
     procs = [subprocess.Popen(c, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -164,19 +179,24 @@ def run_parallel(cmds, job_dir, stage_idx, stage_name, ok_codes=(0,)):
 
 
 def interleaved_convert_validate(job_dir, source, args):
-    """(A) convert -> validate per chunk, deleting each chunk's source immediately.
+    """(A) convert -> validate per chunk, freeing each chunk's source immediately.
 
-    Peak disk ~= src + chunk_workers*chunk_conv + passed_so_far, instead of
-    src + full_conv (which needs >150G on a ~119k-file batch). Per-chunk selection
-    is still collapsed globally by the keep-longest (run_id) stage, matching the
-    existing flow. Returns (conv_rows, qc_rows, passed_files).
+    ``source`` may be a directory of raw JSON/JSONL files, or a ``.zip`` of them.
+    With a zip the archive is read on demand: each chunk's members are extracted
+    just before that chunk is converted and deleted right after, so the full
+    extracted tree is never materialised (peak ~= zip + chunk_extract +
+    chunk_workers*chunk_conv + passed). The zip itself is deleted once every
+    member has been extracted. Per-chunk selection is still collapsed globally by
+    the keep-longest (run_id) stage, matching the existing flow.
+    Returns (conv_rows, qc_rows, passed_files).
     """
-    files = source_files(source)
-    if not files:
-        raise ValueError(f"no JSON/JSONL input files under {source}")
-    n = max(1, min(args.chunk_count, len(files)))
+    is_zip = source.is_file() and source.suffix.lower() == ".zip"
+    entries = _zip_entries(source) if is_zip else source_files(source)
+    if not entries:
+        raise ValueError(f"no JSON/JSONL inputs found under {source}")
+    n = max(1, min(args.chunk_count, len(entries)))
     w = max(1, args.chunk_workers)
-    chunks = [files[i::n] for i in range(n)]  # round-robin (order-preserving)
+    chunks = [entries[i::n] for i in range(n)]  # round-robin (order-preserving)
     conv_dir = job_dir / "conv"
     passed_dir = job_dir / "passed"
     link_root = job_dir / "chunks"
@@ -186,51 +206,69 @@ def interleaved_convert_validate(job_dir, source, args):
     val_bin = str(PIPELINE_DIR / "validate_normalized_b.py")
     conv_rows = qc_rows = freed_files = 0
     passed_files = []
-    for w0 in range(0, n, w):
-        wave = list(range(w0, min(w0 + w, n)))
-        chunk_dirs = {}
-        for i in wave:
-            d = link_root / f"w{i:03d}"
-            d.mkdir(parents=True, exist_ok=True)
-            for f in chunks[i]:
-                dst = d / f.name
-                if not dst.exists():
-                    os.symlink(f, dst)
-            chunk_dirs[i] = d
-        run_parallel(
-            [[sys.executable, conv_bin, str(chunk_dirs[i]),
-              "-o", str(conv_dir / f"w{i:03d}.jsonl"),
-              "--dedupe-session-id", "--max-open-files", str(args.max_open_files)]
-             for i in wave],
-            job_dir, 0, f"转换(片{wave[0]}-{wave[-1]})")
-        run_parallel(
-            [[sys.executable, val_bin, str(conv_dir / f"w{i:03d}.jsonl"),
-              "--report", str(passed_dir / f"w{i:03d}.report.json"),
-              "--passed-output", str(passed_dir / f"w{i:03d}.passed.jsonl"),
-              "--allow-duplicate-run-id"]
-             for i in wave],
-            job_dir, 1, f"质检(片{wave[0]}-{wave[-1]})", ok_codes=(0, 1))
-        for i in wave:
-            co = conv_dir / f"w{i:03d}.jsonl"
-            po = passed_dir / f"w{i:03d}.passed.jsonl"
-            if co.exists():
-                conv_rows += sum(1 for _ in co.open("rb"))
-            if po.exists():
-                qc_rows += sum(1 for _ in po.open("rb"))
-                passed_files.append(po)
-            co.unlink(missing_ok=True)
-            for f in chunks[i]:
-                try:
-                    f.unlink()  # free this chunk's source immediately
-                    freed_files += 1
-                except OSError:
-                    pass
-            shutil.rmtree(chunk_dirs[i], ignore_errors=True)
-            chunks[i] = []
-        log(f"--interleave wave {wave[0]}-{wave[-1]} done: conv={conv_rows} "
-            f"qc={qc_rows} freed_src={freed_files}")
+    zf = zipfile.ZipFile(source) if is_zip else None
+    try:
+        for w0 in range(0, n, w):
+            wave = list(range(w0, min(w0 + w, n)))
+            chunk_dirs = {}
+            for i in wave:
+                d = link_root / f"w{i:03d}"
+                d.mkdir(parents=True, exist_ok=True)
+                if is_zip:
+                    for member in chunks[i]:
+                        _extract_member(zf, member, d)  # stream just this chunk
+                else:
+                    for f in chunks[i]:
+                        dst = d / f.name
+                        if not dst.exists():
+                            os.symlink(f, dst)
+                chunk_dirs[i] = d
+            run_parallel(
+                [[sys.executable, conv_bin, str(chunk_dirs[i]),
+                  "-o", str(conv_dir / f"w{i:03d}.jsonl"),
+                  "--dedupe-session-id", "--max-open-files", str(args.max_open_files)]
+                 for i in wave],
+                job_dir, 0, f"转换(片{wave[0]}-{wave[-1]})")
+            run_parallel(
+                [[sys.executable, val_bin, str(conv_dir / f"w{i:03d}.jsonl"),
+                  "--report", str(passed_dir / f"w{i:03d}.report.json"),
+                  "--passed-output", str(passed_dir / f"w{i:03d}.passed.jsonl"),
+                  "--allow-duplicate-run-id"]
+                 for i in wave],
+                job_dir, 1, f"质检(片{wave[0]}-{wave[-1]})", ok_codes=(0, 1))
+            for i in wave:
+                co = conv_dir / f"w{i:03d}.jsonl"
+                po = passed_dir / f"w{i:03d}.passed.jsonl"
+                if co.exists():
+                    conv_rows += sum(1 for _ in co.open("rb"))
+                if po.exists():
+                    qc_rows += sum(1 for _ in po.open("rb"))
+                    passed_files.append(po)
+                co.unlink(missing_ok=True)
+                if is_zip:
+                    freed_files += len(os.listdir(chunk_dirs[i]))
+                else:
+                    for f in chunks[i]:
+                        try:
+                            f.unlink()  # free this chunk's source immediately
+                            freed_files += 1
+                        except OSError:
+                            pass
+                shutil.rmtree(chunk_dirs[i], ignore_errors=True)
+                chunks[i] = []
+            log(f"--interleave wave {wave[0]}-{wave[-1]} done: conv={conv_rows} "
+                f"qc={qc_rows} freed_src={freed_files}")
+    finally:
+        if zf is not None:
+            zf.close()
+    if is_zip:
+        try:
+            source.unlink()  # every member extracted -> drop the archive
+            log(f"--interleave: source zip removed ({source.name})")
+        except OSError as exc:
+            log(f"--interleave: could not remove source zip: {exc}")
     log(f"--interleave done: conv_rows={conv_rows} qc_rows={qc_rows} "
-        f"freed_src_files={freed_files}")
+        f"freed_src={freed_files} source={'zip' if is_zip else 'dir'}")
     return conv_rows, qc_rows, passed_files
 
 
@@ -238,15 +276,18 @@ def main():
     raise_fd_limit()
     ap = argparse.ArgumentParser()
     ap.add_argument("--job-dir", required=True)
-    ap.add_argument("--source", required=True)
+    ap.add_argument("--source", required=True,
+                    help="source directory of raw JSON/JSONL files, or a .zip of them "
+                         "(with --interleave a .zip is streamed: extracted per chunk)")
     ap.add_argument(
         "--interleave",
         action="store_true",
         help=(
-            "large batches: convert+validate the source in chunks and delete each "
-            "chunk's source files as soon as that chunk is converted, bounding peak "
-            "disk to ~src + chunk_workers*chunk_conv instead of src + full_conv "
-            "(default: off, original single-pass behaviour)"
+            "large batches: convert+validate the source in chunks and free each "
+            "chunk's source as soon as it is converted. With a directory, peak disk "
+            "is ~src + chunk_workers*chunk_conv; with a .zip the archive is extracted "
+            "per chunk so the extracted tree is never materialised at full size "
+            "(fits ~40G-class disks). Default: off, original single-pass behaviour."
         ),
     )
     ap.add_argument("--chunk-count", type=int, default=16,
@@ -271,7 +312,7 @@ def main():
         except Exception:
             return 0
 
-    total_hint = count_lines(source)
+    total_hint = 0 if (source.is_file() and source.suffix.lower() == ".zip") else count_lines(source)
     log(f"job start: source={source} rows~{total_hint}")
     write_status(job_dir, 0, "running", 0)
 
