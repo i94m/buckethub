@@ -4258,6 +4258,15 @@ def api_update_file(file_id: int):
             fields.append("delivered_records = ?")
             params.append(int(val))
 
+    # 交付字节（最终交付内容的字节数）：可空整数
+    if "delivered_bytes" in body:
+        val = body["delivered_bytes"]
+        if val is None or val == "":
+            fields.append("delivered_bytes = NULL")
+        else:
+            fields.append("delivered_bytes = ?")
+            params.append(int(val))
+
     # status 枚举校验
     if "status" in body:
         status_val = str(body["status"])
