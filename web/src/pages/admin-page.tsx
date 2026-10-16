@@ -3,11 +3,14 @@ import { ArrowUpDown, Cloud, FolderOpen, HardDrive, RefreshCw, Search, Workflow 
 
 import { type BucketHealthEntry, type Datasource, type FileItem } from "@/lib/types"
 import { getBucketHealth, getFiles, getScripts } from "@/lib/api"
+import { formatBytes } from "@/lib/utils"
+import { useLiveStats } from "@/lib/use-live-stats"
 import { useTerminalFileRefresh } from "@/lib/use-terminal-file-refresh"
 import { useAppInfo } from "@/components/auth-guard"
 import { useBuckets } from "@/lib/use-buckets"
 import { useJobs } from "@/lib/use-jobs"
 import { Button } from "@/components/ui/button"
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { Input } from "@/components/ui/input"
 import {
   Select,
@@ -90,6 +93,8 @@ function AdminPage() {
   }, [checkHealth])
 
   const [files, setFiles] = React.useState<FileItem[]>([])
+  // 统计卡片：挂载拉一次 + 定时轮询，页面隐藏时暂停（只更新数字节点，不整页重建）
+  const { stats, reload: reloadStats } = useLiveStats(10_000)
 
   /** 单条文件记录更新（检测存在性等轻量操作，不触发全表重载）。 */
   const patchFile = React.useCallback((updated: FileItem) => {
@@ -104,7 +109,20 @@ function AdminPage() {
   const [q, setQ] = React.useState("")
   const [debouncedQ, setDebouncedQ] = React.useState("")
   const [status, setStatus] = React.useState("all")
+  const [sortBy, setSortBy] = React.useState("")
+  const [sortDir, setSortDir] = React.useState<"asc" | "desc">("asc")
   const [refreshing, setRefreshing] = React.useState(false)
+
+  /** 表头排序：同列翻转方向，新列默认升序；翻页回到第 1 页。 */
+  const handleSort = React.useCallback((col: string) => {
+    setPage(1)
+    if (sortBy === col) {
+      setSortDir((d) => (d === "asc" ? "desc" : "asc"))
+    } else {
+      setSortBy(col)
+      setSortDir("asc")
+    }
+  }, [sortBy])
   /** 顶层模块切换：files=源文件管理 / transfers=上传管理 / local=本地文件 / bucket:<id>=各桶（动态）。 */
   const [section, setSection] = React.useState<string>("files")
 
@@ -133,7 +151,7 @@ function AdminPage() {
     loadScripts()
   }, [loadScripts])
 
-  // 文件列表：分页 / 状态 / 防抖后的搜索词 变化时加载
+  // 文件列表：分页 / 状态 / 排序 / 防抖后的搜索词 变化时加载
   React.useEffect(() => {
     let cancelled = false
     setLoading(true)
@@ -142,6 +160,8 @@ function AdminPage() {
       page_size: pageSize,
       q: debouncedQ || undefined,
       status: status === "all" ? undefined : status,
+      sort_by: (sortBy || undefined) as "filename" | "size" | "delivered_records" | "created_at" | undefined,
+      sort_order: sortBy ? sortDir : undefined,
     })
       .then((data) => {
         if (cancelled) return
@@ -166,6 +186,8 @@ function AdminPage() {
         page_size: pageSize,
         q: debouncedQ || undefined,
         status: status === "all" ? undefined : status,
+        sort_by: (sortBy || undefined) as "filename" | "size" | "delivered_records" | "created_at" | undefined,
+        sort_order: sortBy ? sortDir : undefined,
       })
       setFiles(data.items)
       setTotal(data.total)
@@ -174,11 +196,12 @@ function AdminPage() {
     } finally {
       setLoading(false)
     }
-  }, [page, pageSize, debouncedQ, status])
+  }, [page, pageSize, debouncedQ, status, sortBy, sortDir])
 
   const refresh = async () => {
     setRefreshing(true)
     await loadFiles()
+    reloadStats()
     setRefreshing(false)
   }
 
@@ -207,6 +230,32 @@ function AdminPage() {
             <ThemeToggle />
           </div>
         </header>
+
+        {/* 统计卡：总文件 / 预交付 / 已交付（大数字，"/" 分隔 文件/大小/会话） */}
+        <div className="mb-6 flex flex-wrap gap-3">
+          <StatCard
+            label="总文件（文件 / 大小）"
+            value={stats ? `${stats.total} / ${formatBytes(stats.total_bytes)}` : undefined}
+          />
+          <StatCard
+            label="待处理（文件 / 大小）"
+            value={stats ? `${stats.pending} / ${formatBytes(stats.pending_bytes)}` : undefined}
+          />
+          <StatCard
+            label="处理中（文件 / 大小）"
+            value={stats ? `${stats.processing} / ${formatBytes(stats.processing_bytes)}` : undefined}
+          />
+          <StatCard
+            label="预交付（文件 / 大小 / 会话）"
+            value={stats ? `${stats.pre_delivered_files} / ${formatBytes(stats.pre_delivered_bytes)} / ${stats.pre_delivered_sessions.toLocaleString()}` : undefined}
+            hint={stats ? `大小为交付产物字节（已打包暂存、尚未上传 OBS）；源 zip 合计 ${formatBytes(stats.pre_delivered_source_bytes)}` : undefined}
+          />
+          <StatCard
+            label="已交付（文件 / 大小 / 会话）"
+            value={stats ? `${stats.delivered_files} / ${formatBytes(stats.delivered_bytes)} / ${stats.synced.toLocaleString()}` : undefined}
+            hint={stats ? `大小为交付产物字节（已上传 OBS 的分片合计）；源 zip 合计 ${formatBytes(stats.delivered_source_bytes)}` : undefined}
+          />
+        </div>
 
         {/* Bucket 公开告警 */}
         {bucketPrivate === false && (
@@ -329,8 +378,10 @@ function AdminPage() {
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value="all">全部状态</SelectItem>
-                  <SelectItem value="synced">已上传</SelectItem>
-                  <SelectItem value="pending">待上传</SelectItem>
+                  <SelectItem value="pending">待处理</SelectItem>
+                  <SelectItem value="processing">处理中</SelectItem>
+                  <SelectItem value="processed">处理完成</SelectItem>
+                  <SelectItem value="synced">已交付</SelectItem>
                   <SelectItem value="failed">失败</SelectItem>
                   <SelectItem value="deleted">已删除</SelectItem>
                 </SelectContent>
@@ -359,6 +410,9 @@ function AdminPage() {
               onPageChange={setPage}
               onDeleted={loadFiles}
               onFileUpdated={patchFile}
+              sortBy={sortBy}
+              sortDir={sortDir}
+              onSortChange={handleSort}
             />
           </TabsContent>
 
@@ -401,3 +455,20 @@ function AdminPage() {
 }
 
 export default AdminPage
+
+/** 统计卡：大数字一行（"/" 分隔多指标）+ 下方标签；可选 hint 悬停提示。 */
+function StatCard({ label, value, hint }: { label: string; value: React.ReactNode | undefined; hint?: string }) {
+  const card = (
+    <div className="rounded-xl border bg-card px-4 py-3 whitespace-nowrap">
+      <div className="text-2xl font-bold tabular-nums">{value ?? "—"}</div>
+      <div className="text-xs text-muted-foreground">{label}</div>
+    </div>
+  )
+  if (!hint) return card
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>{card}</TooltipTrigger>
+      <TooltipContent className="max-w-sm">{hint}</TooltipContent>
+    </Tooltip>
+  )
+}

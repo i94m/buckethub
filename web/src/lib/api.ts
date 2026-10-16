@@ -56,12 +56,16 @@ export async function getFiles(params: {
   page_size?: number
   q?: string
   status?: string
+  sort_by?: "filename" | "size" | "delivered_records" | "created_at"
+  sort_order?: "asc" | "desc"
 }): Promise<FilesResponse> {
   const qs = new URLSearchParams()
   if (params.page) qs.set("page", String(params.page))
   if (params.page_size) qs.set("page_size", String(params.page_size))
   if (params.q) qs.set("q", params.q)
   if (params.status) qs.set("status", params.status)
+  if (params.sort_by) qs.set("sort_by", params.sort_by)
+  if (params.sort_by && params.sort_order) qs.set("sort_order", params.sort_order)
   const res = await fetch(`/api/files?${qs}`, { headers: headers() })
   return handle<FilesResponse>(res)
 }
@@ -70,6 +74,34 @@ export async function getFiles(params: {
 export async function getFile(fileId: number): Promise<FileItem> {
   const res = await fetch(`/api/files/${fileId}`, { headers: headers() })
   return handle<FileItem>(res)
+}
+
+export interface FileStats {
+  total: number
+  total_bytes: number
+  pending: number
+  pending_bytes: number
+  processing: number
+  processing_bytes: number
+  processed: number
+  delivered_files: number
+  /** 交付产物字节（已上传 OBS 的分片合计） */
+  delivered_bytes: number
+  /** 源 zip 字节（供卡片悬停提示） */
+  delivered_source_bytes: number
+  pre_delivered_files: number
+  /** 预交付产物字节（已打包暂存、尚未上传 OBS） */
+  pre_delivered_bytes: number
+  /** 源 zip 字节（供卡片悬停提示） */
+  pre_delivered_source_bytes: number
+  pre_delivered_sessions: number
+  synced: number
+}
+
+/** GET /api/stats — 首页统计卡片数据。 */
+export async function getStats(): Promise<FileStats> {
+  const res = await fetch("/api/stats", { headers: headers() })
+  return handle<FileStats>(res)
 }
 
 /** GET /api/scripts — 数据源列表（id→名称映射）。 */

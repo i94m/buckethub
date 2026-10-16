@@ -600,6 +600,7 @@ def init_db() -> None:
                 ("download_kind", "VARCHAR(20)"),
                 ("download_bucket_id", "INT"),
                 ("local_path", "VARCHAR(1024)"),
+                ("delivered_records", "BIGINT"),
                 ("auto_upload_buckets", "TEXT"),
                 ("updated_at", "DOUBLE"),
             ):
@@ -1768,11 +1769,8 @@ def check_bucket_health(client, bucket_name: str, endpoint: str, addressing: str
 # Flask 路由
 # --------------------------------------------------------------------------
 
-def apikey_ok() -> bool:
-    """检查 apikey：支持 query param、X-API-Key header、Authorization Bearer。"""
-    expected = os.environ.get("APP_API_KEY", "")
-    if not expected:
-        return False
+def _provided_key() -> str:
+    """从 query param / X-API-Key header / Bearer 提取请求携带的 key。"""
     provided = request.args.get("apikey", "")
     if not provided:
         provided = request.headers.get("X-API-Key", "")
@@ -1780,15 +1778,57 @@ def apikey_ok() -> bool:
         auth = request.headers.get("Authorization", "")
         if auth.startswith("Bearer "):
             provided = auth[7:]
+    return provided
+
+
+def _expected_keys() -> list[str]:
+    """全部有效 key：APP_API_KEY（管理）+ APP_API_KEY_PUBLIC（首页浏览）。"""
+    keys = [os.environ.get("APP_API_KEY", "")]
+    public = os.environ.get("APP_API_KEY_PUBLIC", "").strip()
+    if public:
+        keys.append(public)
+    return [k for k in keys if k]
+
+
+def apikey_ok() -> bool:
+    """检查 apikey（管理 key 或首页浏览 key 均可）：query / X-API-Key / Bearer。"""
+    expected = _expected_keys()
+    if not expected:
+        return False
+    provided = _provided_key()
+    if not provided:
+        return False
+    return any(secrets.compare_digest(provided, k) for k in expected)
+
+
+def is_admin_key() -> bool:
+    """当前请求携带的是管理 key（APP_API_KEY）。"""
+    expected = os.environ.get("APP_API_KEY", "")
+    if not expected:
+        return False
+    provided = _provided_key()
     return bool(provided) and secrets.compare_digest(provided, expected)
 
 
 def require_auth():
-    if not apikey_ok():
+    """管理级鉴权：仅管理 key（APP_API_KEY）可通过。"""
+    if not is_admin_key():
         if wants_json():
             return jsonify({"error": "未授权"}), 401
         return Response("401 未授权", status=401)
     return None
+
+
+@app.before_request
+def _mutations_require_admin_key():
+    """写操作（POST/PUT/PATCH/DELETE）仅限管理 key；GET 任意有效 key均可。"""
+    if request.method not in ("POST", "PUT", "PATCH", "DELETE"):
+        return None
+    if is_admin_key():
+        return None
+    if wants_json():
+        return jsonify({"error": "需要管理密钥（admin apikey）"}), 403
+    return Response("403 需要管理密钥", status=403)
 
 
 def wants_json() -> bool:
@@ -3351,6 +3391,7 @@ def api_auth():
     bucket2 = next((b for b in buckets if b.get("legacy_key") == "bucket2"), None)
     return jsonify({
         "app": "buckethub",
+        "role": "admin" if is_admin_key() else "public",
         "bucket": default["bucket_name"] if default else "",
         "default_prefix": default_prefix(),
         "bucket_private": BUCKET_PRIVATE,
@@ -3429,6 +3470,90 @@ def _file_item(conn, row) -> dict:
     return d
 
 
+def _receipt_delivered_bytes(error):
+    """从交付凭证（error 列）里取本批交付产物字节。
+
+    仅作 `delivered_bytes` 列为空时的兜底（未来新批尚未落列值），
+    口径与历史回填一致：manifest/delivered/shards[].bytes 求和，
+    否则取顶层 bytes，再否则从文字凭证里抓 bytes=N。
+    """
+    if not error:
+        return 0
+    s = error.strip()
+    try:
+        d = json.loads(s)
+    except Exception:
+        d = None
+    if isinstance(d, dict):
+        for key in ("manifest", "delivered", "shards"):
+            v = d.get(key)
+            if isinstance(v, list):
+                tot = 0
+                for it in v:
+                    if isinstance(it, dict) and isinstance(it.get("bytes"), (int, float)):
+                        tot += int(it["bytes"])
+                if tot:
+                    return tot
+        if isinstance(d.get("bytes"), (int, float)):
+            return int(d["bytes"])
+        return 0
+    import re as _re
+    m = _re.search(r"bytes\s*[:=]\s*(\d+)", s)
+    return int(m.group(1)) if m else 0
+
+
+@app.get("/api/stats")
+def api_stats():
+    """首页统计卡片：总文件 / 处理中 / 已处理 / 已交付。
+
+    处理中 = status=processing 的文件数；
+    已处理 = 已交付的文件数（status=synced 的记录条数，不是会话条数）；
+    已交付 = synced 记录的 delivered_records（会话条数）总和。
+    """
+    if not apikey_ok():
+        return jsonify({"error": "未授权"}), 401
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT status, COUNT(*) AS c, COALESCE(SUM(size), 0) AS sb, "
+            "COALESCE(SUM(delivered_bytes), 0) AS db, "
+            "COALESCE(SUM(delivered_records), 0) AS dr FROM files GROUP BY status"
+        ).fetchall()
+        # 兜底：delivered_bytes 未落库的批（未来新批）从交付凭证里取字节，
+        # 免得新批交付后卡片漏计；历史批列值已回填。
+        fallback_rows = conn.execute(
+            "SELECT status, error FROM files WHERE delivered_bytes IS NULL"
+        ).fetchall()
+    counts = {r["status"]: r["c"] for r in rows}
+    sizes = {r["status"]: int(r["sb"]) for r in rows}
+    delivered_bytes_sum = {r["status"]: int(r["db"]) for r in rows}
+    sessions = {r["status"]: int(r["dr"]) for r in rows}
+    for r in fallback_rows:
+        b = _receipt_delivered_bytes(r["error"])
+        if b:
+            delivered_bytes_sum[r["status"]] = delivered_bytes_sum.get(r["status"], 0) + b
+    with get_db() as conn:
+        synced_sessions = int(conn.execute(
+            "SELECT COALESCE(SUM(delivered_records), 0) AS s FROM files WHERE status = 'synced'"
+        ).fetchone()["s"])
+    return jsonify({
+        "total": sum(counts.values()),
+        "total_bytes": sum(sizes.values()),
+        "pending_bytes": sizes.get("pending", 0),
+        "pending": counts.get("pending", 0),
+        "processing": counts.get("processing", 0),
+        "processing_bytes": sizes.get("processing", 0),
+        "processed": counts.get("processed", 0),
+        "delivered_files": counts.get("synced", 0),
+        "delivered_bytes": delivered_bytes_sum.get("synced", 0),
+        "delivered_source_bytes": sizes.get("synced", 0),
+        "pre_delivered_files": counts.get("processed", 0),
+        "pre_delivered_bytes": delivered_bytes_sum.get("processed", 0),
+        "pre_delivered_source_bytes": sizes.get("processed", 0),
+        "pre_delivered_sessions": sessions.get("processed", 0),
+        "synced": synced_sessions,
+    })
+
+
 @app.get("/api/files")
 def api_files():
     """文件库分页列表（DataTable 数据源）。
@@ -3438,6 +3563,8 @@ def api_files():
         page_size 每页条数，1~200（默认 20）
         q         可选，按 filename / source_url 模糊匹配
         status    可选，按 status 精确过滤
+        sort_by   可选，排序列（filename / size / delivered_records / created_at）
+        sort_order 可选，asc / desc（默认 desc；sort_by 缺省时按 id 倒序）
 
     返回：
         {
@@ -3453,6 +3580,24 @@ def api_files():
     offset = (page - 1) * page_size
     q = (request.args.get("q") or "").strip()
     status = (request.args.get("status") or "").strip()
+    # 排序：白名单列 + 方向（防注入）；delivered_records 的 NULL（未交付）恒排最后
+    sort_by = (request.args.get("sort_by") or "").strip()
+    sort_order = (request.args.get("sort_order") or "desc").strip().lower()
+    SORT_COLUMNS = {
+        "filename": "filename",
+        "size": "size",
+        "delivered_records": "delivered_records",
+        "created_at": "created_at",
+    }
+    if sort_by in SORT_COLUMNS:
+        direction = "ASC" if sort_order == "asc" else "DESC"
+        order_sql = (
+            f"ORDER BY (delivered_records IS NULL) ASC, delivered_records {direction}, id DESC"
+            if sort_by == "delivered_records"
+            else f"ORDER BY {SORT_COLUMNS[sort_by]} {direction}, id DESC"
+        )
+    else:
+        order_sql = "ORDER BY id DESC"
 
     where_sql = ""
     params: list = []
@@ -3476,7 +3621,7 @@ def api_files():
             f"SELECT COUNT(*) AS c FROM files {where_sql}", params
         ).fetchone()["c"]
         rows = conn.execute(
-            f"SELECT * FROM files {where_sql} ORDER BY id DESC LIMIT ? OFFSET ?",
+            f"SELECT * FROM files {where_sql} {order_sql} LIMIT ? OFFSET ?",
             [*params, page_size, offset],
         ).fetchall()
         # 按页内 file id 批查上传关联 → uploaded_bucket_ids
@@ -4041,7 +4186,7 @@ def api_update_file(file_id: int):
         size                           整数
         uploaded_bucket_ids            number[]（替换语义：勾选的桶集合）
         uploaded, uploaded_beijing, uploaded_bucket2  旧布尔（机器人兼容，映射 file_uploads）
-        status                         pending|synced|failed|deleted|cancelled
+        status                         pending|processed|synced|failed|deleted|cancelled
         datasource_id                  整数或 null
         download_kind                  文件级下载源 none|url|local|bucket（'none'/空 → 清空）；
                                        kind=bucket 需带 download_bucket_id（校验桶存在）
@@ -4104,10 +4249,19 @@ def api_update_file(file_id: int):
         fields.append("size = ?")
         params.append(int(body["size"] or 0))
 
+    # 交付条数（最终交付内容的会话条数）：可空整数
+    if "delivered_records" in body:
+        val = body["delivered_records"]
+        if val is None or val == "":
+            fields.append("delivered_records = NULL")
+        else:
+            fields.append("delivered_records = ?")
+            params.append(int(val))
+
     # status 枚举校验
     if "status" in body:
         status_val = str(body["status"])
-        if status_val in ("pending", "synced", "failed", "deleted", "cancelled"):
+        if status_val in ("pending", "processing", "processed", "synced", "failed", "deleted", "cancelled"):
             fields.append("status = ?")
             params.append(status_val)
 

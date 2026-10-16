@@ -34,18 +34,27 @@ REDACTIONS: list[tuple[str, re.Pattern, int | None]] = [
 
 
 def redact_string(text: str):
-    """返回 (脱敏后文本, 命中计数 Counter)。"""
+    """返回 (脱敏后文本, 命中计数 Counter)。
+
+    多趟直到不动点：先行规则的替换标记（如 private_ip 的 ]] 结尾）可能
+    解除后行规则此前的 lookbehind 屏蔽（如 IP 数字紧贴 /home/...），
+    单趟会留下 sensitive_hits 残留。标记文本对全部规则惰性，重复应用安全。
+    """
     from collections import Counter
 
     counts = Counter()
     out = text
-    for tag, pattern, group in REDACTIONS:
-        def _sub(m, _tag=tag, _group=group):
-            counts[_tag] += 1
-            if _group is None:
-                return f"[[REDACTED:{_tag}]]"
-            return m.group(0).replace(m.group(_group), f"[[REDACTED:{_tag}]]")
-        out = pattern.sub(_sub, out)
+    for _ in range(3):
+        before = out
+        for tag, pattern, group in REDACTIONS:
+            def _sub(m, _tag=tag, _group=group):
+                counts[_tag] += 1
+                if _group is None:
+                    return f"[[REDACTED:{_tag}]]"
+                return m.group(0).replace(m.group(_group), f"[[REDACTED:{_tag}]]")
+            out = pattern.sub(_sub, out)
+        if out == before:
+            break
     return out, counts
 
 

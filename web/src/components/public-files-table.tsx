@@ -7,11 +7,12 @@ import {
   useReactTable,
 } from "@tanstack/react-table"
 import { type Bucket } from "@/lib/api"
-import { type FileItem, type JobUpdate } from "@/lib/types"
+import { type Datasource, type FileItem, type JobUpdate } from "@/lib/types"
 import { cn, formatBytes, formatTime } from "@/lib/utils"
 import { useJobs } from "@/lib/use-jobs"
 import { JobProgressBadge } from "@/components/progress-cell"
 import { StatusText } from "@/components/status-text"
+import { FileStatusBadge, SortableHead } from "@/components/sortable-head"
 
 /** 活跃（排队中/传输中）任务按 object_key 匹配出的行级状态。 */
 export interface ActiveFileStatus {
@@ -29,7 +30,6 @@ import {
 } from "@/components/ui/table"
 import { Skeleton } from "@/components/ui/skeleton"
 import { NumberPagination } from "@/components/number-pagination"
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { CopyButton } from "@/components/ui/copy-button"
 
 /**
@@ -74,11 +74,28 @@ function ReadOnlySyncCell({
   )
 }
 
+/** 只读来源单元格（与管理页文件来源列同口径，去掉复制/操作）。 */
+function DownloadSourceLabel({ file }: { file: FileItem }) {
+  const label =
+    file.download_kind === "url"
+      ? "网络链接"
+      : file.download_kind === "local"
+        ? "本地"
+        : file.download_kind === "bucket"
+          ? `桶 ${file.download_bucket_id ?? "?"}`
+          : "未配置"
+  return <span className="text-xs text-muted-foreground">{label}</span>
+}
+
 /** 骨架行各列的宽度类（按 columns 顺序对齐）。 */
 function skeletonWidths(bucketCount: number): string[] {
   const widths = [
-    "w-64",   // ObjectKey
-    "w-20",   // 大小（居中）
+    "w-16",   // 数据源
+    "w-16",   // 文件来源
+    "w-48",   // 文件名称
+    "w-20",   // 大小
+    "w-20",   // 交付条数
+    "w-16",   // 处理状态
     "w-16",   // 本地
   ]
   for (let i = 0; i < bucketCount; i++) widths.push("w-16") // 各桶列
@@ -88,6 +105,8 @@ function skeletonWidths(bucketCount: number): string[] {
 
 interface PublicFilesTableProps {
   data: FileItem[]
+  /** 数据源列表（数据源 id → 名称映射，与管理页一致）。 */
+  scripts: Datasource[]
   /** 全部桶（仅启用桶生成列，与管理页一致）。 */
   buckets: Bucket[]
   /** object_key → 活跃任务状态（正在上传/下载的文件，可能尚未登记为文件记录）。 */
@@ -97,11 +116,16 @@ interface PublicFilesTableProps {
   pageSize: number
   loading: boolean
   onPageChange: (page: number) => void
+  /** 服务端排序状态（文件名称/大小/交付条数/创建时间）。 */
+  sortBy?: string
+  sortDir?: "asc" | "desc"
+  onSortChange?: (col: string) => void
 }
 
 /** 公开页只读表格：文件 × 桶同步状态矩阵（无选择/操作列）。 */
 export function PublicFilesTable({
   data,
+  scripts,
   buckets,
   activeMap,
   total,
@@ -109,11 +133,21 @@ export function PublicFilesTable({
   pageSize,
   loading,
   onPageChange,
+  sortBy,
+  sortDir,
+  onSortChange,
 }: PublicFilesTableProps) {
   const enabledBuckets = React.useMemo(
     () => buckets.filter((b) => b.enabled),
     [buckets],
   )
+
+  /** 数据源 id → 名称（与管理页同口径，供「数据源」列）。 */
+  const datasourceName = React.useMemo(() => {
+    const map = new Map<number, string>()
+    scripts.forEach((s) => map.set(s.id, s.name))
+    return map
+  }, [scripts])
 
   // 展示行 = 当前页文件记录 ∪ 活跃任务对应的文件（去重：同一 object_key 只保留一条，
   // 文件记录优先——其大小/时间等元数据完整，活跃状态经 activeMap 叠加到单元格）。
@@ -139,6 +173,7 @@ export function PublicFilesTable({
         download_kind: null,
         download_bucket_id: null,
         local_path: null,
+        delivered_records: null,
         created_at: status.job.created_at,
         updated_at: status.job.created_at,
         synced_at: null,
@@ -152,34 +187,75 @@ export function PublicFilesTable({
     () => {
       const cols: ColumnDef<FileItem>[] = [
         {
-          accessorKey: "object_key",
-          header: "ObjectKey",
+          accessorKey: "datasource_id",
+          header: "数据源",
+          cell: ({ row }) => {
+            const name = row.original.datasource_id
+              ? datasourceName.get(row.original.datasource_id)
+              : null
+            if (!name) return <span className="text-muted-foreground">—</span>
+            return <span className="text-xs">{name}</span>
+          },
+        },
+        {
+          id: "download_source",
+          header: "文件来源",
+          cell: ({ row }) => <DownloadSourceLabel file={row.original} />,
+        },
+        {
+          accessorKey: "filename",
+          header: () => (
+            <SortableHead label="文件名称" col="filename" sortBy={sortBy} sortDir={sortDir} onSort={onSortChange} />
+          ),
+          cell: ({ row }) => {
+            const f = row.original
+            if (!f.filename) {
+              return <span className="text-muted-foreground">—</span>
+            }
+            return (
+              <div className="flex items-center gap-1">
+                <span className="block max-w-[11rem] truncate sm:max-w-[24rem]">{f.filename}</span>
+                <CopyButton
+                  value={f.filename}
+                  title="复制文件名"
+                  className="size-5 p-0.5 hover:bg-muted"
+                />
+              </div>
+            )
+          },
+        },
+        {
+          accessorKey: "size",
+          header: () => (
+            <div className="min-w-[5rem] text-center">
+              <SortableHead label="大小" col="size" sortBy={sortBy} sortDir={sortDir} onSort={onSortChange} />
+            </div>
+          ),
           cell: ({ row }) => (
-            <div className="flex items-center gap-1">
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <span className="block max-w-[11rem] truncate font-mono text-xs sm:max-w-[26rem]">
-                    {row.original.object_key}
-                  </span>
-                </TooltipTrigger>
-                <TooltipContent className="max-w-sm break-all">
-                  {row.original.object_key}
-                </TooltipContent>
-              </Tooltip>
-              <CopyButton
-                value={row.original.object_key}
-                title="复制 ObjectKey"
-                className="size-5 p-0.5 hover:bg-muted"
-              />
+            <div className="text-center tabular-nums text-muted-foreground">
+              {formatBytes(row.original.size)}
             </div>
           ),
         },
         {
-          accessorKey: "size",
-          header: () => <div className="min-w-[5rem] text-center">大小</div>,
+          accessorKey: "delivered_records",
+          header: () => (
+            <div className="min-w-[4.5rem] text-center">
+              <SortableHead label="交付条数" col="delivered_records" sortBy={sortBy} sortDir={sortDir} onSort={onSortChange} />
+            </div>
+          ),
           cell: ({ row }) => (
             <div className="text-center tabular-nums text-muted-foreground">
-              {formatBytes(row.original.size)}
+              {row.original.delivered_records == null ? "—" : row.original.delivered_records.toLocaleString()}
+            </div>
+          ),
+        },
+        {
+          id: "file_status",
+          header: () => <div className="min-w-[4rem] text-center">处理状态</div>,
+          cell: ({ row }) => (
+            <div className="flex justify-center">
+              <FileStatusBadge file={row.original} />
             </div>
           ),
         },
@@ -214,7 +290,9 @@ export function PublicFilesTable({
       })
       cols.push({
         accessorKey: "created_at",
-        header: () => <div className="text-left">创建时间</div>,
+        header: () => (
+          <SortableHead label="创建时间" col="created_at" sortBy={sortBy} sortDir={sortDir} onSort={onSortChange} />
+        ),
         cell: ({ row }) => (
           <span className="whitespace-nowrap text-muted-foreground">
             {formatTime(row.original.created_at)}
@@ -223,7 +301,7 @@ export function PublicFilesTable({
       })
       return cols
     },
-    [enabledBuckets, activeMap],
+    [enabledBuckets, activeMap, datasourceName, sortBy, sortDir, onSortChange],
   )
 
   const table = useReactTable({
@@ -266,7 +344,7 @@ export function PublicFilesTable({
                         className={cn(
                           "h-4",
                           skelWidths[j] ?? "w-20",
-                          j === 1 && "mx-auto", // 大小列居中
+                          j === 3 && "mx-auto", // 大小列居中
                         )}
                       />
                     </TableCell>

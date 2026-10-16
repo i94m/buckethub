@@ -4,7 +4,7 @@ import { ThemeProvider } from "next-themes"
 import { JobsProvider } from "@/lib/use-jobs"
 import { BucketsProvider } from "@/lib/use-buckets"
 import { withApiKey } from "@/lib/link"
-import { AuthGuard } from "@/components/auth-guard"
+import { AdminGuard, AuthGuard } from "@/components/auth-guard"
 import { Toaster } from "@/components/ui/sonner"
 import { TooltipProvider } from "@/components/ui/tooltip"
 import AdminPage from "@/pages/admin-page"
@@ -24,9 +24,11 @@ export default function App() {
             <JobsProvider>
               <TooltipProvider>
                 <Routes>
-                  <Route path="/" element={<PublicPage />} />
-                  <Route path="/admin" element={<AdminPage />} />
-                  <Route path="*" element={<Navigate to={withApiKey("/")} replace />} />
+                  {/* 旧首页 / 重定向到 /dashboard（保留 apikey 查询参数） */}
+                  <Route path="/" element={<Navigate to={withApiKey("/dashboard")} replace />} />
+                  <Route path="/dashboard" element={<PublicPage />} />
+                  <Route path="/admin" element={<AdminGuard><AdminPage /></AdminGuard>} />
+                  <Route path="*" element={<Navigate to={withApiKey("/dashboard")} replace />} />
                 </Routes>
                 <Toaster />
               </TooltipProvider>

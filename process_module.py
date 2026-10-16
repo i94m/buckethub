@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS process_jobs (
     label VARCHAR(255) NOT NULL DEFAULT '',
     source_path VARCHAR(1024) NOT NULL,
     workdir VARCHAR(1024) NOT NULL,
+    file_id INT,
     status VARCHAR(20) NOT NULL DEFAULT 'queued',
     stage VARCHAR(64) NOT NULL DEFAULT '',
     progress DOUBLE NOT NULL DEFAULT 0,
@@ -105,6 +106,23 @@ def get_db_conn():
 def ensure_tables():
     with get_db_conn() as conn:
         conn.execute(DDL)
+        cols = {row["Field"] for row in conn.execute("SHOW COLUMNS FROM process_jobs")}
+        if "file_id" not in cols:
+            conn.execute("ALTER TABLE process_jobs ADD COLUMN file_id INT")
+
+
+def _resolve_file_id(conn, source: str):
+    """按服务器路径/来源匹配文件记录（local_path 最长命中优先）。"""
+    if not source:
+        return None
+    row = conn.execute(
+        """SELECT id FROM files
+           WHERE (local_path IS NOT NULL AND local_path <> ''
+                  AND (local_path = ? OR ? LIKE CONCAT('%/', local_path)))
+              OR source_url = ? OR object_key = ?
+           ORDER BY LENGTH(local_path) DESC LIMIT 1""",
+        (source, source, source, source)).fetchone()
+    return row["id"] if row else None
 
 
 def create_process_job(source: str, label: str) -> int:
@@ -112,11 +130,12 @@ def create_process_job(source: str, label: str) -> int:
     workdir = str(PROCESS_DIR / f"job-{int(time.time())}")
     now = time.time()
     with get_db_conn() as conn:
+        file_id = _resolve_file_id(conn, source)
         cur = conn.execute(
             """INSERT INTO process_jobs
-               (label, source_path, workdir, status, stage, progress, created_at)
-               VALUES (%s, %s, %s, 'queued', '排队中', 0, %s)""",
-            (label, source, workdir, now))
+               (label, source_path, workdir, status, stage, progress, created_at, file_id)
+               VALUES (%s, %s, %s, 'queued', '排队中', 0, %s, %s)""",
+            (label, source, workdir, now, file_id))
         job_id = cur.lastrowid
         PROCESS_QUEUE.append(job_id)
         with PROCESS_COND:
@@ -245,6 +264,24 @@ def run_job(job_id: int):
     if rc == 0:
         update_job(job_id, status="completed", stage="完成", progress=100,
                    stats_json=extra_stats, finished_at=time.time())
+        # 处理完成：回写交付条数 delivered_records，并把状态从
+        # pending/processing 推进到 processed（已交付 synced 的保持不动）
+        records = None
+        try:
+            records = json.loads(status_path.read_text(encoding="utf-8")).get("records")
+        except Exception:
+            records = None
+        file_id = row.get("file_id")
+        if file_id:
+            with get_db_conn() as conn:
+                conn.execute(
+                    "UPDATE files SET "
+                    "delivered_records = COALESCE(?, delivered_records), "
+                    "status = CASE WHEN status IN ('pending', 'processing') "
+                    "THEN 'processed' ELSE status END, "
+                    "updated_at = %s "
+                    "WHERE id = %s",
+                    (records if isinstance(records, int) else None, time.time(), file_id))
     elif rc == 3:
         update_job(job_id, status="cancelled", finished_at=time.time())
     else:

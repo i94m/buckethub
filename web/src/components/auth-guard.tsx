@@ -62,3 +62,19 @@ export function AuthGuard({ children }: { children: React.ReactNode }) {
     </div>
   )
 }
+
+/** 管理页守卫：仅 admin key（role=admin）可进入管理页；公网 key 显示提示。 */
+export function AdminGuard({ children }: { children: React.ReactNode }) {
+  const info = useAppInfo()
+  if (!info) return null
+  if (info.role === "admin") return <>{children}</>
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-background px-4">
+      <div className="flex flex-col items-center gap-3 text-center text-muted-foreground">
+        <LockKeyhole className="size-8" />
+        <p className="text-lg font-medium">需要管理密钥</p>
+        <p className="text-sm">当前 apikey 仅有首页浏览权限，请使用管理地址访问。</p>
+      </div>
+    </div>
+  )
+}

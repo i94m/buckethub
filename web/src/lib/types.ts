@@ -27,6 +27,8 @@ export interface FileItem {
   /** kind=bucket 时指向的桶 id。 */
   download_bucket_id: number | null
   local_path: string | null // 已下载到服务器 SERVER_FILE_ROOT 的相对路径
+  /** 最终交付内容的会话条数（B 类流水线交付的记录数；未交付为 null）。 */
+  delivered_records: number | null
   created_at: number
   updated_at: number
   synced_at: number | null
@@ -93,6 +95,8 @@ export interface ConcurrencyInfo {
 /** GET / 根路由的引导信息。 */
 export interface AppInfo {
   app: string
+  /** 当前 key 的角色：admin=管理（可写）/ public=首页浏览（只读）。 */
+  role?: "admin" | "public"
   bucket: string
   default_prefix: string
   bucket_private: boolean | null

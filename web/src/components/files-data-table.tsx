@@ -32,6 +32,7 @@ import { useBuckets } from "@/lib/use-buckets"
 import { useConfirm } from "@/lib/use-confirm"
 import { JobProgressBadge } from "@/components/progress-cell"
 import { StatusText } from "@/components/status-text"
+import { FileStatusBadge, SortableHead } from "@/components/sortable-head"
 import { Button } from "@/components/ui/button"
 import { Checkbox } from "@/components/ui/checkbox"
 import {
@@ -111,6 +112,10 @@ interface FilesDataTableProps {
   onFileUpdated?: (file: FileItem) => void
   /** 数据处理任务列表（清洗列状态来源）。 */
   processJobs?: ProcessJobLite[]
+  /** 服务端排序状态（文件名称/大小/交付条数/创建时间）。 */
+  sortBy?: string
+  sortDir?: "asc" | "desc"
+  onSortChange?: (col: string) => void
 }
 
 /** 截断长文本 + tooltip 显示完整值。 */
@@ -827,6 +832,9 @@ export function FilesDataTable({
   onDeleted,
   onFileUpdated,
   processJobs = [],
+  sortBy,
+  sortDir,
+  onSortChange,
 }: FilesDataTableProps & { processJobs?: ProcessJobLite[] }) {
   const datasourceName = React.useMemo(() => {
     const map = new Map<number, string>()
@@ -882,7 +890,9 @@ export function FilesDataTable({
         },
         {
           accessorKey: "filename",
-          header: "文件名称",
+          header: () => (
+            <SortableHead label="文件名称" col="filename" sortBy={sortBy} sortDir={sortDir} onSort={onSortChange} />
+          ),
           cell: ({ row }) => {
             const f = row.original
             if (!f.filename) {
@@ -901,30 +911,37 @@ export function FilesDataTable({
           },
         },
         {
-          id: "object_key",
-          header: "ObjectKey",
+          accessorKey: "size",
+          header: () => (
+            <div className="min-w-[5rem] text-center">
+              <SortableHead label="大小" col="size" sortBy={sortBy} sortDir={sortDir} onSort={onSortChange} />
+            </div>
+          ),
           cell: ({ row }) => (
-            <div className="flex items-center gap-1">
-              <span
-                className="block max-w-[10rem] truncate font-mono text-xs text-muted-foreground"
-                title={row.original.object_key}
-              >
-                {row.original.object_key}
-              </span>
-              <CopyButton
-                value={row.original.object_key}
-                title="复制 ObjectKey"
-                className="size-5 p-0.5 hover:bg-muted"
-              />
+            <div className="text-center tabular-nums text-muted-foreground">
+              {formatBytes(row.original.size)}
             </div>
           ),
         },
         {
-          accessorKey: "size",
-          header: () => <div className="min-w-[5rem] text-center">大小</div>,
+          accessorKey: "delivered_records",
+          header: () => (
+            <div className="min-w-[4.5rem] text-center">
+              <SortableHead label="交付条数" col="delivered_records" sortBy={sortBy} sortDir={sortDir} onSort={onSortChange} />
+            </div>
+          ),
           cell: ({ row }) => (
             <div className="text-center tabular-nums text-muted-foreground">
-              {formatBytes(row.original.size)}
+              {row.original.delivered_records == null ? "—" : row.original.delivered_records.toLocaleString()}
+            </div>
+          ),
+        },
+        {
+          id: "file_status",
+          header: () => <div className="min-w-[4rem] text-center">处理状态</div>,
+          cell: ({ row }) => (
+            <div className="flex justify-center">
+              <FileStatusBadge file={row.original} />
             </div>
           ),
         },
@@ -956,7 +973,9 @@ export function FilesDataTable({
       cols.push(
         {
           accessorKey: "created_at",
-          header: () => <div className="text-left">创建时间</div>,
+          header: () => (
+            <SortableHead label="创建时间" col="created_at" sortBy={sortBy} sortDir={sortDir} onSort={onSortChange} />
+          ),
           cell: ({ row }) => (
             <span className="whitespace-nowrap text-muted-foreground">
               {formatTime(row.original.created_at)}
@@ -978,7 +997,7 @@ export function FilesDataTable({
       )
       return cols
     },
-    [datasourceName, onDeleted, onFileUpdated, enabledBuckets],
+    [datasourceName, onDeleted, onFileUpdated, enabledBuckets, sortBy, sortDir, onSortChange],
   )
 
   const table = useReactTable({
@@ -1256,6 +1275,7 @@ function RowActions({
 /** 状态枚举 → 中文标签（提交值仍为后端枚举）。 */
 const STATUS_OPTIONS: Array<{ value: string; label: string }> = [
   { value: "pending", label: "待处理" },
+  { value: "processed", label: "处理完成" },
   { value: "synced", label: "已同步" },
   { value: "failed", label: "失败" },
   { value: "deleted", label: "已删除" },

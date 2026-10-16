@@ -204,6 +204,13 @@ def main():
     final_dir.mkdir(parents=True, exist_ok=True)
     idx, written, count = 1, 0, 0
     shards = []
+    # 交付命名：<源zip名>_<合格条数>_part-0000N.jsonl（条数=该分片内会话数；
+    # 流式写盘先用临时名 part-0000N.jsonl，写完回填改名）
+    src_stem = re.sub(r"[^A-Za-z0-9._-]", "_", source.stem) or "batch"
+
+    def shard_final_name(n: int, i: int) -> str:
+        return f"{src_stem}_{n}_part-{i:05d}.jsonl"
+
     dst = (final_dir / f"part-{idx:05d}.jsonl").open("w", encoding="utf-8")
     with redacted.open(encoding="utf-8") as src_fh:
         for line in src_fh:
@@ -212,13 +219,17 @@ def main():
             count += 1
             if written >= 1_450_000_000:
                 dst.close()
-                shards.append({"file": dst.name, "bytes": written, "records": count})
+                final_name = shard_final_name(count, idx)
+                (final_dir / dst.name).rename(final_dir / final_name)
+                shards.append({"file": final_name, "bytes": written, "records": count})
                 idx += 1
                 written, count = 0, 0
                 dst = (final_dir / f"part-{idx:05d}.jsonl").open("w", encoding="utf-8")
     dst.close()
     if count:
-        shards.append({"file": dst.name, "bytes": written, "records": count})
+        final_name = shard_final_name(count, idx)
+        (final_dir / dst.name).rename(final_dir / final_name)
+        shards.append({"file": final_name, "bytes": written, "records": count})
     else:
         (final_dir / dst.name).unlink()
 
