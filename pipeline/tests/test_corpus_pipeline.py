@@ -745,3 +745,50 @@ class TestDeliveryNaming(_PipelineCase):
         parts = sorted(int(name.split("part-")[1].split(".")[0]) for name in names)
         self.assertEqual(parts, list(range(1, len(names) + 1)), "part 编号必须从 1 连续")
         self.assertEqual(sum(s["samples"] for s in man["shards"]), 6)
+
+
+class TestS3RangeResume(_PipelineCase):
+    """S3 分支：分段续跑必须从 next_offset 发 Range GET，而不是从头再流一遍。"""
+
+    class _FakeClient:
+        def __init__(self, payload: bytes):
+            self.payload = payload
+            self.calls = []
+
+        def get_object(self, **kwargs):
+            import io
+            self.calls.append(kwargs)
+            data = self.payload
+            rng = kwargs.get("Range")
+            if rng:
+                start = int(rng.split("=")[1].rstrip("-"))
+                data = data[start:]
+            return {"Body": io.BytesIO(data)}
+
+    def test_resume_uses_range_from_next_offset(self):
+        import io  # noqa: F401
+        import unittest.mock as mock
+
+        payload = b"".join(
+            json.dumps(make_record(uuid=f"u{i}", n=100, seed=f"s{i}"), ensure_ascii=False).encode() + b"\n"
+            for i in range(6)
+        )
+        fake = self._FakeClient(payload)
+        with mock.patch.object(cp, "make_client", lambda args: fake):
+            for _ in range(12):
+                cp.main(["--execute", "--keys", "remote-0001.jsonl",
+                         "--out-dir", str(self.out), "--phase", "index",
+                         "--max-seconds", "0.000001"])
+                state = json.loads((self.out / "state.json").read_text())
+                if state["index"]["done"]:
+                    break
+
+        self.assertEqual([c.get("Range") for c in fake.calls if c.get("Range") is None][:1], [None])
+        ranges = [c["Range"] for c in fake.calls if c.get("Range")]
+        self.assertTrue(ranges, "续跑必须用 Range GET")
+        for rng in ranges:
+            start = int(rng.split("=")[1].rstrip("-"))
+            self.assertGreater(start, 0)
+        rows = [json.loads(ln) for ln in (self.out / "index.jsonl").read_text().splitlines()]
+        self.assertEqual(len(rows), 6)
+        self.assertEqual(len({r["id"] for r in rows}), 6)
