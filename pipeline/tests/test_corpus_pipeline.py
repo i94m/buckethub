@@ -334,12 +334,20 @@ class TestEndToEnd(unittest.TestCase):
         self.assertEqual(sum(s["samples"] for s in manifest["shards"]), 4)
 
     def test_stop_reason_token_target(self):
-        recs = [make_record(uuid=f"u{i}", n=100, seed=f"s{i}") for i in range(5)]
-        write_dataset(self.src, recs)
-        self.run_pipeline("--target-tokens", "1")   # 第一条写完就过线
+        # 锁定口径：停点在**源文件边界**——第一个文件全部交付后过线即停，
+        # 第二个文件一条都不碰（不是记录边界截断）。
+        write_dataset(self.src, [make_record(uuid=f"u{i}", n=100, seed=f"s{i}") for i in range(3)])
+        key2 = "synthetic-0002.jsonl"
+        with open(self.src / key2, "wb") as fh:
+            for i in range(3, 6):
+                fh.write(json.dumps(make_record(uuid=f"u{i}", n=100, seed=f"s{i}"),
+                                    ensure_ascii=False).encode() + b"\n")
+        self.run_pipeline("--target-tokens", "1")   # 第一个文件写完就过线
         manifest = json.loads((self.out / "manifest.json").read_text())
         self.assertEqual(manifest["STOP_REASON"], "token_target_reached")
-        self.assertEqual(manifest["delivered_samples"], 1)
+        self.assertEqual(manifest["stop_file"], "synthetic-0001.jsonl")
+        self.assertEqual(manifest["delivered_samples"], 3)
+        self.assertEqual(manifest["not_delivered"], 3)
 
     def test_resume_does_not_duplicate(self):
         recs = [make_record(uuid=f"u{i}", n=100, seed=f"s{i}") for i in range(4)]
@@ -545,3 +553,195 @@ class TestRegressionDeliveredLedger(_PipelineCase):
         self.assertEqual(per_file_windows, man["delivered_samples"])
         self.assertEqual(man["ledger"]["delivered_records"], man["delivered_records"])
         self.assertEqual(man["ledger"]["delivered_windows"], man["delivered_samples"])
+
+
+# ---------------------------------------------------------------- 分段 / 并发 / 交付形态
+# 2026-11-03 v2 改造（跨段续跑 + 并发同步读 + 按源文件命名）的回归用例。
+# 每条都先红后绿：改造前的实现上必然失败。
+
+import socket  # noqa: E402
+import time as _time  # noqa: E402
+
+
+def write_named(dirpath: Path, name: str, records):
+    with open(dirpath / name, "wb") as fh:
+        for rec in records:
+            fh.write(json.dumps(rec, ensure_ascii=False).encode() + b"\n")
+    return name
+
+
+class TestSegments(_PipelineCase):
+    """软时限分段 + 续跑：多次调用必须与一次跑完等价。"""
+
+    def _two_files(self, n_each=3):
+        write_named(self.src, "src-0001.jsonl",
+                    [make_record(uuid=f"a{i}", n=100, seed=f"a{i}") for i in range(n_each)])
+        write_named(self.src, "src-0002.jsonl",
+                    [make_record(uuid=f"b{i}", n=100, seed=f"b{i}") for i in range(n_each)])
+
+    def test_many_segments_equal_single_run(self):
+        self._two_files()
+        ref = self.root / "ref"
+        cp.main(["--execute", "--local-dir", str(self.src), "--out-dir", str(ref),
+                 "--target-tokens", "1000000000"])
+
+        # 每段只允许推进一条（软时限瞬间过期）：逼出"段间中断 → 续跑"路径
+        for _ in range(80):
+            cp.main(["--execute", "--local-dir", str(self.src), "--out-dir", str(self.out),
+                     "--target-tokens", "1000000000", "--max-seconds", "0.000001"])
+            if (self.out / "manifest.json").exists():
+                man = json.loads((self.out / "manifest.json").read_text())
+                if not man.get("SEGMENT_PAUSED"):
+                    break
+
+        man = json.loads((self.out / "manifest.json").read_text())
+        self.assertFalse(man.get("SEGMENT_PAUSED"), "分段没有收敛到完成态")
+        self.assertEqual(man["STOP_REASON"], "corpus_exhausted")
+        self.assertGreater(man["segments"], 5, "用例前提：必须真的分成多段")
+
+        ref_man = json.loads((ref / "manifest.json").read_text())
+        self.assertEqual(man["delivered_samples"], ref_man["delivered_samples"])
+        self.assertEqual(man["delivered_tokens"], ref_man["delivered_tokens"])
+        self.assertEqual(man["delivered_records"], ref_man["delivered_records"])
+        for shard in man["shards"]:
+            self.assertEqual((self.out / shard["file"]).read_bytes(),
+                             (ref / shard["file"]).read_bytes())
+
+    def test_index_stops_at_line_boundary(self):
+        self._two_files()
+        for _ in range(6):
+            cp.main(["--execute", "--local-dir", str(self.src), "--out-dir", str(self.out),
+                     "--phase", "index", "--max-seconds", "0.000001"])
+        with open(self.out / "index.jsonl", "rb") as fh:
+            data = fh.read()
+        self.assertTrue(data.endswith(b"\n"), "暂停点必须落在完整行边界")
+        rows = [json.loads(ln) for ln in data.splitlines() if ln.strip()]
+        self.assertEqual(len(rows), 6)
+        self.assertEqual(len({r["id"] for r in rows}), 6, "续跑不得重复索引同一条记录")
+        offsets = {}
+        for row in rows:
+            offsets.setdefault(row["key"], []).append(row["off"])
+        for key, offs in offsets.items():
+            self.assertEqual(len(offs), len(set(offs)), f"{key} 的偏移重复")
+
+    def test_index_truncates_half_written_tail(self):
+        self._two_files()
+        cp.main(["--execute", "--local-dir", str(self.src), "--out-dir", str(self.out),
+                 "--phase", "index"])
+        before = (self.out / "index.jsonl").stat().st_size
+        with open(self.out / "index.jsonl", "ab") as fh:
+            fh.write(b'{"id": "half-line-from-a-crash')
+        cp.main(["--execute", "--local-dir", str(self.src), "--out-dir", str(self.out),
+                 "--phase", "index"])
+        self.assertEqual((self.out / "index.jsonl").stat().st_size, before)
+        rows = [json.loads(ln) for ln in (self.out / "index.jsonl").read_text().splitlines()]
+        self.assertEqual(len(rows), 6)
+
+
+    def test_scan_reports_progress_so_lock_heartbeat_stays_fresh(self):
+        """长扫描必须在扫描中上报进度，否则 20 GiB 单文件会被误判成死锁而遭接管。"""
+        write_named(self.src, "long-0001.jsonl",
+                    [make_record(uuid=f"u{i}", n=100, seed=f"s{i}") for i in range(450)])
+        args = cp.build_parser(["--execute", "--local-dir", str(self.src),
+                                "--out-dir", str(self.out)]).parse_args(
+            ["--execute", "--local-dir", str(self.src), "--out-dir", str(self.out)])
+        beats = []
+        res = cp._scan_file(args, None, "long-0001.jsonl", 0, 0, cp.SegmentBudget(0),
+                            on_progress=lambda: beats.append(1))
+        self.assertEqual(res["scanned"], 450)
+        self.assertTrue(res["eof"])
+        self.assertGreaterEqual(len(beats), 2, "每 200 条至少上报一次进度")
+
+    def test_index_gate_survives_later_segments(self):
+        """闸门一旦触发，后续分段不得把闸门清掉继续拉新文件（否则会白下整桶）。"""
+        for i in range(3):
+            write_named(self.src, f"src-{i:04d}.jsonl",
+                        [make_record(uuid=f"g{i}", n=100, seed=f"g{i}")])
+        for _ in range(3):
+            cp.main(["--execute", "--local-dir", str(self.src), "--out-dir", str(self.out),
+                     "--target-tokens", "1", "--index-connections", "1"])
+        man = json.loads((self.out / "manifest.json").read_text())
+        self.assertEqual(man["index"]["files_done"], 1, "闸门触发后不允许再索引新文件")
+        self.assertEqual(man["STOP_REASON"], "token_target_reached")
+        self.assertEqual(man["stop_file"], "src-0000.jsonl")
+        self.assertEqual({s["source_key"] for s in man["shards"]}, {"src-0000.jsonl"})
+
+
+class TestLock(_PipelineCase):
+    def test_fresh_lock_blocks_second_instance(self):
+        write_named(self.src, "src-0001.jsonl", [make_record(uuid="u1", n=100)])
+        self.out.mkdir(parents=True, exist_ok=True)
+        (self.out / "run.lock").write_text(json.dumps({
+            "pid": os.getpid(), "host": socket.gethostname(), "heartbeat": _time.time()}))
+        rc = cp.main(["--execute", "--local-dir", str(self.src), "--out-dir", str(self.out)])
+        self.assertEqual(rc, 0)
+        self.assertFalse((self.out / "state.json").exists(), "锁被占时不允许写任何进度")
+        self.assertFalse((self.out / "index.jsonl").exists())
+
+    def test_stale_lock_is_taken_over(self):
+        write_named(self.src, "src-0001.jsonl", [make_record(uuid="u1", n=100)])
+        self.out.mkdir(parents=True, exist_ok=True)
+        (self.out / "run.lock").write_text(json.dumps({
+            "pid": 999999, "host": "old-host", "heartbeat": _time.time() - 3600}))
+        cp.main(["--execute", "--local-dir", str(self.src), "--out-dir", str(self.out)])
+        self.assertTrue((self.out / "manifest.json").exists(), "过期锁必须被接管")
+        self.assertFalse((self.out / "run.lock").exists(), "跑完要释放锁")
+
+
+class TestConcurrencyEquivalence(_PipelineCase):
+    """串行 vs 并发必须语义等价：同一条记录集合、同样的交付字节。"""
+
+    def _four_files(self):
+        for i in range(4):
+            write_named(self.src, f"src-{i:04d}.jsonl",
+                        [make_record(uuid=f"u{i}-{j}", n=100, seed=f"s{i}-{j}") for j in range(3)])
+
+    def test_index_and_emit_serial_vs_concurrent(self):
+        self._four_files()
+        serial = self.root / "serial"
+        parallel = self.root / "parallel"
+        for out, conn, pre in ((serial, "1", "1"), (parallel, "4", "4")):
+            cp.main(["--execute", "--local-dir", str(self.src), "--out-dir", str(out),
+                     "--target-tokens", "1000000000",
+                     "--index-connections", conn, "--emit-prefetch", pre])
+        a = [json.loads(ln) for ln in (serial / "index.jsonl").read_text().splitlines()]
+        b = [json.loads(ln) for ln in (parallel / "index.jsonl").read_text().splitlines()]
+        self.assertEqual(sorted(a, key=lambda r: r["id"]), sorted(b, key=lambda r: r["id"]),
+                         "并发与串行索引出的记录集合/顺序值必须一致")
+
+        ma = json.loads((serial / "manifest.json").read_text())
+        mb = json.loads((parallel / "manifest.json").read_text())
+        self.assertEqual(ma["delivered_samples"], mb["delivered_samples"])
+        self.assertEqual(ma["delivered_tokens"], mb["delivered_tokens"])
+        names_a = sorted(s["file"] for s in ma["shards"])
+        names_b = sorted(s["file"] for s in mb["shards"])
+        self.assertEqual(names_a, names_b)
+        for name in names_a:
+            self.assertEqual((serial / name).read_bytes(), (parallel / name).read_bytes())
+
+
+class TestDeliveryNaming(_PipelineCase):
+    def test_artifacts_named_after_source(self):
+        write_named(self.src, "gpt-6-astra-0009-20261001.jsonl",
+                    [make_record(uuid="u1", n=100, seed="a")])
+        write_named(self.src, "gpt-6-astra-0010-20261001.jsonl",
+                    [make_record(uuid="u2", n=100, seed="b")])
+        self.run_pipeline("--target-tokens", "1000000000")
+        man = self.manifest()
+        names = sorted(s["file"] for s in man["shards"])
+        self.assertEqual(names, ["gpt-6-astra-0009-20261001.jsonl",
+                                 "gpt-6-astra-0010-20261001.jsonl"])
+        self.assertFalse(any(n.startswith("deliver-") for n in names))
+
+    def test_parts_when_single_source_exceeds_shard_bytes(self):
+        write_named(self.src, "big-0001.jsonl",
+                    [make_record(uuid=f"u{i}", n=100, seed=f"s{i}") for i in range(6)])
+        self.run_pipeline("--target-tokens", "1000000000", "--shard-bytes", "4000")
+        man = self.manifest()
+        names = [s["file"] for s in man["shards"]]
+        self.assertGreater(len(names), 1)
+        for name in names:
+            self.assertRegex(name, r"^big-0001\.part-\d{4}\.jsonl$")
+        parts = sorted(int(name.split("part-")[1].split(".")[0]) for name in names)
+        self.assertEqual(parts, list(range(1, len(names) + 1)), "part 编号必须从 1 连续")
+        self.assertEqual(sum(s["samples"] for s in man["shards"]), 6)

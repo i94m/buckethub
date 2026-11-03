@@ -88,6 +88,10 @@ python pipeline/corpus_pipeline.py --execute --reset --out-dir ./corpus_out
 | `--tokenizer` | o200k_base | tiktoken 编码 |
 | `--tokens-per-byte` | 0.1015 | index 阶段止损预估系数 |
 | `--phase` | all | `index` / `plan` / `emit` / `all` |
+| `--max-seconds` | 0 | 本段软时限（秒）；到点后在安全点让出，下次调用自动续跑（0=不分段） |
+| `--index-connections` | 4 | index 跨文件并发连接数（按 key 顺序 flush，输出与串行等价） |
+| `--emit-prefetch` | 4 | emit 有序预取深度（并发 Range GET，写仍单线程） |
+| `--lock-ttl` | 300 | `run.lock` 心跳过期秒数；心跳新鲜时第二个实例直接退出 |
 | `--execute` | 关 | 不加以外一律 dry-run |
 
 ## 四、产物
@@ -96,13 +100,18 @@ python pipeline/corpus_pipeline.py --execute --reset --out-dir ./corpus_out
 <out-dir>/
   index.jsonl        # 过滤通过的记录：key/off/len/uuid/n_msgs/seq(hex)/order
   keep.jsonl         # 去重后的保留清单（emit 的输入）
-  deliver-0001.jsonl # 交付分片，每条 = 原始记录（未切窗时原样字节）
-  deliver-0002.jsonl
-  emit.journal       # 逐行交付流水（id/key/shard/bytes/tokens），续跑与对账依据
-  state.json         # 断点状态（index 已完成的 key、ledger、stop_reason）
+  <源文件>.jsonl      # 交付产物：按源文件命名，未切窗时原样字节
+  <源文件>.part-0001.jsonl  # 单源超过 --shard-bytes 时切分片（编号从 1 连续）
+  emit.journal       # 逐行交付流水（id/key/part/bytes/tokens），续跑与对账依据
+  state.json         # 断点状态（index 逐文件 next_offset、emit 逐文件状态、stop_file）
+  run.lock           # 单实例锁（pid/host/heartbeat；心跳新鲜时第二个实例直接退出）
   ledger.json        # 分文件账本：扫描/各过滤原因/两步移除/交付
-  manifest.json      # 汇总：STOP_REASON、token 总数、分片清单、口径配置、closure 校验
+  manifest.json      # 汇总：STOP_REASON、stop_file、token 总数、产物清单、口径配置、closure 校验
 ```
+
+**停点在源文件边界**：累计交付量到 `--target-tokens` 后，把当前源文件剩下的记录全部处理完再停，
+后续源文件一条都不碰。因此超出量上界是「停止文件自身的产出」（1B 目标下约 3~6%），
+而不是单条记录的 token。
 
 `manifest.json` 关键字段：
 
@@ -111,11 +120,16 @@ python pipeline/corpus_pipeline.py --execute --reset --out-dir ./corpus_out
   "STOP_REASON": "token_target_reached | corpus_exhausted",
   "stop_after_record": {"id": "…jsonl#12345", "key": "…jsonl", "off": 12345,
                         "n_msgs": 260, "windows": 3, "tokens": 186022, "tokens_total_after": 1000000123},
+  "stop_file": "gpt-6-astra-0009-20261001.jsonl",
+  "SEGMENT_PAUSED": false,
+  "delivered_files": [{"source_key": "…jsonl", "status": "delivered", "mode": "single",
+                       "parts": 1, "records": 380, "tokens": 135000000}],
   "delivered_tokens": 1000000123,
   "delivered_samples": 2810,
   "kept_records": 2815,
   "not_delivered": 5,
-  "shards": [{"file": "deliver-0001.jsonl", "samples": 380, "bytes": 500123456, "tokens": 135000000}],
+  "shards": [{"file": "gpt-6-astra-0009-20261001.jsonl", "source_key": "…jsonl", "part": 1,
+              "samples": 380, "bytes": 500123456, "tokens": 135000000}],
   "ledger": {"scanned": 1234, "passed": 567, "session_removed": 0, "prefix_removed": 480,
              "filter_closure_ok": true},
   "dedup_closure_ok": true
@@ -186,3 +200,27 @@ python -m unittest discover -s pipeline/tests -v   # 38 例
 - **`delivered_tokens` 可能略超目标**：因为窗口组原子提交，过线的那一组会整组落盘，最多超出*一条记录*的 token 量（前缀去重后单条均值 356k）。
 - **超长单条**：`messages` 里单条 message 自身的 token 就超过 128k 时，它会独占一个窗口并在 `_window.oversize_message` 计数——这是数据问题，不应静默丢弃。
 - token 数含 `encrypted_content` 密文（口径 5）；如需"仅可读文本"口径，需另跑一版，两者不可混用。
+
+## 六、跨段执行（两天无人值守）
+
+```bash
+# 每段最多 18 分钟，跑完退出；下一段原样续跑（不要 --reset）
+python pipeline/corpus_pipeline.py --execute --target-tokens 1000000000 \
+  --out-dir <OUT>/full --max-seconds 1080
+```
+
+- `index` 在**完整行边界**让出，进度存 `(key, next_byte_offset)`；`index.jsonl` 按已 fsync 的字节长度
+  截尾，续跑既不会重复也不会解析到半行。
+- `emit` 在**记录组边界**让出；`emit.journal` 是唯一真相，段首从 journal 重算已交付量。
+- 单实例锁：`run.lock` 心跳 5 分钟内有效，第二个实例立即退出（退出码 0，不写任何进度）。
+- 段末顺序铁律：分片 fsync → journal fsync → `state.json`；反过来会出现"账上有、盘上没有"。
+- 中途 manifest 的 `STOP_REASON=segment_paused` / `SEGMENT_PAUSED=true` 不是终态，别拿去验收。
+
+## 七、并发语义
+
+`--index-connections` 只并发**跨文件**的流式读取，写入仍按 key 顺序单线程 flush；
+`order` 由 `(文件排名, 文件内字节偏移)` 决定，与分段/并发无关。因此：
+
+- 同一批源文件，串行与并发的 `index.jsonl` **行序可能不同**（分段会交错多个文件的块），
+  但记录集合、`order` 值、以及 `plan`/`emit` 的产物**逐字节相同**——`tests/test_corpus_pipeline.py::TestConcurrencyEquivalence` 锁死这一点。
+- `read_range` 的单条语义、整组窗口原子提交、停点位置、去重算法**未改动**。
