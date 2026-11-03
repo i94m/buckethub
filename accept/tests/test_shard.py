@@ -146,10 +146,13 @@ class RecordContentTest(_Base):
 
 class TokenLimitTest(_Base):
     def test_record_over_limit_rejected(self):
+        # 多条 message 累计超限 = 窗口切得太大（真 bug），文案必须是这一种
         _write(self.dir, "deliver-0001.jsonl", [_record(1, 120)])
         cfg = shard.ShardConfig(max_record_tokens=200)
         report = shard.check_delivery(self.dir, cfg, counter=self.counter, check_prefix_invariant=False)
-        self.assertTrue(any("token 超过上限" in m for m in self._errors(report)))
+        errors = self._errors(report)
+        self.assertTrue(any("窗口整体超限" in m for m in errors), errors)
+        self.assertFalse(any("单条 message 自身超限" in m for m in errors), "不该误判成固有超限")
 
     def test_windowed_record_over_limit_still_rejected(self):
         record = _record(1, 120)
@@ -157,8 +160,50 @@ class TokenLimitTest(_Base):
         _write(self.dir, "deliver-0001.jsonl", [record])
         cfg = shard.ShardConfig(max_record_tokens=200)
         report = shard.check_delivery(self.dir, cfg, counter=self.counter, check_prefix_invariant=False)
-        messages = self._errors(report)
-        self.assertTrue(any("token 超过上限" in m and "切窗" in m for m in messages))
+        self.assertTrue(any("窗口整体超限" in m for m in self._errors(report)))
+
+
+class IntrinsicOversizeTest(_Base):
+    """单条 message 自身超 128k（图片 base64）：切窗无解，只能走显式口径例外。"""
+
+    def _record_with_huge_message(self) -> dict:
+        record = _record(1, 100)
+        record["request"]["messages"][3]["content"].append(
+            {"type": "input_image", "image_url": "data:image/png;base64," + "A" * 5000}
+        )
+        return record
+
+    def _cfg(self, **kw):
+        return shard.ShardConfig(max_record_tokens=2000, **kw)
+
+    def test_default_is_strict(self):
+        _write(self.dir, "deliver-0001.jsonl", [self._record_with_huge_message()])
+        report = shard.check_delivery(self.dir, self._cfg(), counter=self.counter,
+                                      check_prefix_invariant=False)
+        errors = self._errors(report)
+        self.assertTrue(any("单条 message 自身超限" in m for m in errors), errors)
+        self.assertTrue(any("需口径例外" in m for m in errors), errors)
+        self.assertFalse(any("窗口整体超限" in m for m in errors), "不该误判成窗口太大")
+        self.assertFalse(report.ok)
+
+    def test_whitelist_turns_it_into_warn(self):
+        _write(self.dir, "deliver-0001.jsonl", [self._record_with_huge_message()])
+        cfg = self._cfg(allow_intrinsic_oversize=True)
+        report = shard.check_delivery(self.dir, cfg, counter=self.counter,
+                                      check_prefix_invariant=False)
+        self.assertTrue(report.ok, [p.message for p in report.all_problems()])
+        self.assertEqual(report.shards[0].intrinsic_oversize_records, 1)
+        self.assertTrue(any(p.level == "warn" and "已按 --allow-intrinsic-oversize 放行" in p.message
+                            for p in report.all_problems()))
+
+    def test_whitelist_does_not_cover_oversized_window(self):
+        # 多条 message 累计超限仍然必须报错，白名单不该把真正的窗口过大放过去
+        _write(self.dir, "deliver-0001.jsonl", [_record(1, 120)])
+        cfg = shard.ShardConfig(max_record_tokens=200, allow_intrinsic_oversize=True)
+        report = shard.check_delivery(self.dir, cfg, counter=self.counter,
+                                      check_prefix_invariant=False)
+        self.assertTrue(any("窗口整体超限" in m for m in self._errors(report)))
+        self.assertFalse(report.ok)
 
 
 class ShardLayoutTest(_Base):

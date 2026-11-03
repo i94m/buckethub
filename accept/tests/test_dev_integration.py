@@ -379,3 +379,89 @@ class CrosscheckGlobTest(unittest.TestCase):
             "--shard-glob", "gpt-*.jsonl",
         ])
         self.assertEqual(code, 0)
+
+
+class SessionTieIntegrationTest(unittest.TestCase):
+    """tie 场景：开发侧与验收侧必须选出同一条记录（crosscheck 全对）。
+
+    修前：开发侧按 timestamp、验收侧按序列指纹 → 两边选不同的记录 →
+    交付集摘要对不上、crosscheck 永久报错。
+    """
+
+    def setUp(self) -> None:
+        self._tmp = TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.raw = self.root / "raw"
+        self.raw.mkdir()
+        # 同 uuid、同 messages 数、同字节长度，只有内容与 timestamp 不同
+        records = [
+            synth.record(session_uuid="tie-int", messages=synth.dialog(100, prefix="AAA"),
+                         user_hash="u1", rs_id="rs_aaa", timestamp="2026-01-01T00:00:00Z"),
+            synth.record(session_uuid="tie-int", messages=synth.dialog(100, prefix="DDD"),
+                         user_hash="u2", rs_id="rs_ddd", timestamp="2026-02-01T00:00:00Z"),
+        ]
+        with open(self.raw / "gpt-tie-0001.jsonl", "w", encoding="utf-8") as handle:
+            for rec in records:
+                handle.write(json.dumps(rec, ensure_ascii=False, separators=(",", ":")) + "\n")
+        self.out = self.root / "out"
+        proc = subprocess.run(
+            [sys.executable, str(PIPELINE), "--execute", "--local-dir", str(self.raw),
+             "--out-dir", str(self.out), "--target-tokens", "1000000000"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_both_sides_pick_the_same_record(self):
+        report = crosscheck.compare(self.raw, self.out, shard_glob="*.jsonl")
+        self.assertEqual(report["per_file_mismatches"], [])
+        self.assertTrue(report["kept"]["digests_match"], report["kept"])
+        self.assertEqual(report["kept"]["theirs"], 1, "同 uuid 的两条只能交付一条")
+        self.assertEqual(report["tokens"]["delta"], 0)
+
+
+class CrosscheckKeyMatchingTest(unittest.TestCase):
+    """crosscheck 原生支持带前缀的完整源对象 key（真实数据形态）。"""
+
+    def setUp(self) -> None:
+        self._tmp = TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.raw = self.root / "raw"
+        self.raw.mkdir()
+        for j in range(2):
+            rec = synth.record(session_uuid=f"key-{j}", messages=synth.dialog(100, prefix=f"K{j}"),
+                               user_hash=f"k{j}", rs_id=f"rs_k{j}")
+            with open(self.raw / "gpt-key-0001.jsonl", "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(rec, ensure_ascii=False, separators=(",", ":")) + "\n")
+        self.out = self.root / "out"
+        proc = subprocess.run(
+            [sys.executable, str(PIPELINE), "--execute", "--local-dir", str(self.raw),
+             "--out-dir", str(self.out), "--target-tokens", "1000000000"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _prefix_ledger_keys(self, prefix: str = "Gpt-2026-10-18/") -> None:
+        path = self.out / "ledger.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["files"] = {prefix + k: v for k, v in payload["files"].items()}
+        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    def test_prefixed_source_key_matches_by_basename(self):
+        self._prefix_ledger_keys()
+        report = crosscheck.compare(self.raw, self.out, shard_glob="gpt-*.jsonl")
+        self.assertEqual(report["per_file_mismatches"], [], "带前缀的 key 必须能对上本地文件")
+        self.assertTrue(report["kept"]["digests_match"])
+        matched = {item["source_key"]: item["matched_as"] for item in report["key_matching"]}
+        self.assertEqual(matched.get("Gpt-2026-10-18/gpt-key-0001.jsonl"), "basename")
+
+    def test_unmatched_prefix_still_reports_missing(self):
+        self._prefix_ledger_keys(prefix="Other-Dir/")
+        report = crosscheck.compare(self.raw, self.out, shard_glob="gpt-*.jsonl")
+        # 末段一致，所以仍应对上——证明匹配依据是末段而不是整串相等
+        self.assertEqual(report["per_file_mismatches"], [])

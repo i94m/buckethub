@@ -374,3 +374,33 @@ python -m accept.crosscheck --raw-dir <RAW> --delivery <OUT> --shard-glob 'gpt-*
 
 `.part-NNNN` 从 0001 起、首片也带后缀；`<主干>.jsonl` 与 `<主干>.part-0001.jsonl` 不允许并存
 （验收侧会报「命名冲突，交付形态不唯一」）。
+
+## 十二、session 去重并列规则（与开发侧同一份契约）
+
+同 uuid 的全序：**messages 最长 → timestamp 较新 → 原下标较小**。
+
+以前这里用 `(序列指纹, 原下标)` 兜底，与开发侧的 timestamp 规则冲突：真实数据上只要
+"序列指纹序"与"时间序"相反，两侧就会选出不同记录，crosscheck 会永久报
+`delivered 缺 1 / 多 1`。现在两侧同一规则，并且 `crosscheck` 把 `timestamp` 一起带进
+去重输入（少了它，时间关键字会退化成空串，tie 又变回按下标选）。
+
+## 十三、128k 固有超限的白名单（默认关闭）
+
+单条 message 自身就超 128k（典型是 `content[]` 里的图片 base64），切窗从物理上无解。
+错误文案现在分成两种，便于区分"口径例外"与"真 bug"：
+
+| 形态 | 文案 | 默认 |
+| --- | --- | --- |
+| 单条 message 自身超限 | `单条 message 自身超限（… 切窗无解，需口径例外）` | error |
+| 多条 message 累计超限 | `窗口整体超限（… 窗口切得太大）` | error |
+
+`--allow-intrinsic-oversize` 只把**第一种**降级为 warn（并在 `shards[].intrinsic_oversize_records`
+计数），第二种仍然报错——白名单不能拿来放过真正的窗口切分 bug。默认关闭：
+A' 路径下 verify 保持严格，只有 B 路径（含图交付）点火时才需要显式打开。
+
+## 十四、crosscheck 的 key 对齐
+
+真实数据的 manifest `source_key` 是带前缀的完整对象 key（`Gpt-2026-10-18/xxx.jsonl`），
+而本地 `--raw-dir` 里只有文件名。`crosscheck` 先做精确匹配，再按**末段**匹配，
+并在报告 `key_matching` 里写明每条用了哪种方式；末段重名（不同前缀的同名文件）会标
+`ambiguous_basename`，不静默串味。

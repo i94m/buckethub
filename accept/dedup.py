@@ -133,6 +133,14 @@ class DedupeResult:
 # --------------------------------------------------------------------------
 
 
+def _record_timestamp(record: Any) -> str:
+    """去重并列时的第二关键字：ISO 时间串，字典序即时间序；缺省视为最旧。"""
+    if not isinstance(record, dict):
+        return ""
+    value = record.get("timestamp")
+    return str(value) if value else ""
+
+
 def dedupe_session(
     records: Sequence[Any],
     *,
@@ -141,7 +149,10 @@ def dedupe_session(
 ) -> DedupeResult:
     """按 ``session_id`` 的 uuid 段去重，同户保留 ``messages`` 最长那条。
 
-    并列最长时按 (序列指纹, 原下标) 兜底，保证可复现。
+    并列时的兜底顺序与开发侧同一份契约（全序、确定性）：
+    **messages 最长 → timestamp 较新 → 原下标较小**。
+    早先这里用 (序列指纹, 原下标) 兜底，与开发侧的 timestamp 规则冲突——
+    1B 规模下会持续让 crosscheck 误报「两侧选了不同记录」。
     """
     if keep != "longest":
         raise ValueError(f"不支持的保留策略: {keep!r}（锁定口径只有 longest）")
@@ -161,14 +172,10 @@ def dedupe_session(
         if len(members) == 1:
             result.kept.append(members[0])
             continue
-        ranked = sorted(
-            members,
-            key=lambda i: (
-                -len(get_messages(records[i])),
-                sequence_bytes(get_messages(records[i])),
-                i,
-            ),
-        )
+        # 三次稳定排序拼出 (最长, timestamp 新→旧, 原下标小→大)
+        ranked = sorted(members)
+        ranked.sort(key=lambda i: _record_timestamp(records[i]), reverse=True)
+        ranked.sort(key=lambda i: -len(get_messages(records[i])))
         winner = ranked[0]
         result.kept.append(winner)
         winner_len = len(get_messages(records[winner]))

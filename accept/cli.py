@@ -98,6 +98,7 @@ def _shard_config(args: argparse.Namespace, fake_tokens: bool) -> shard.ShardCon
         allow_top_level_window_messages=bool(
             getattr(args, "allow_top_level_window_messages", False)
         ),
+        allow_intrinsic_oversize=bool(getattr(args, "allow_intrinsic_oversize", False)),
     )
     if fake_tokens:
         # 占位计数器下 token 阈值没有物理意义，放宽到字符量级避免误判。
@@ -686,6 +687,12 @@ def _add_config_args(parser: argparse.ArgumentParser) -> None:
         help="放行「窗口内容写在顶层 messages」的切窗形态（默认判错，需双方确认口径后再开）",
     )
     parser.add_argument(
+        "--allow-intrinsic-oversize",
+        action="store_true",
+        help="放行「单条 message 自身就超 token 上限」的记录（图片 base64 等，切窗无解）；"
+             "默认关闭，只用于口径例外已批准的 B 路径",
+    )
+    parser.add_argument(
         "--allow-fake-tokenizer",
         action="store_true",
         help="允许占位分词器（只用于离线跑通管道，报告会标 acceptance_valid=false）",
@@ -702,6 +709,7 @@ def _cmd_verify(args: argparse.Namespace) -> int:
         print(f"  排除名单 : {', '.join(cfg.exclude_names)}")
         print(f"  单条上限 : {cfg.max_record_tokens} token，messages ≥ {cfg.min_messages}")
         print("  将执行   : 逐文件对账 / 分片完整性 / token 复算 / 交付集前缀不变量 / 分片与 manifest 交叉核对")
+        print(f"  128k 例外 : {'开（单条 message 固有超限按 warn 放行）' if cfg.allow_intrinsic_oversize else '关（严格）'}")
         info = tokens.tokenizer_info()
         print(f"  分词器   : tiktoken {info['encoding']} 可用={info['available']}")
         print("  加 --execute 才会真的跑。")

@@ -196,3 +196,53 @@ class ScaleTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SessionTieBreakTest(unittest.TestCase):
+    """并列全序：messages 最长 → timestamp 较新 → 原下标较小。
+
+    开发侧与验收侧必须是同一份规则，否则 1B 规模下 crosscheck 会持续误报。
+    """
+
+    def _rec(self, ts: str, seed: str, turns: int = 100) -> dict:
+        return synth.record(
+            session_uuid="tie",
+            messages=synth.dialog(turns, prefix=seed),
+            user_hash=f"u{seed}",
+            rs_id=f"rs_{seed}",
+            timestamp=ts,
+        )
+
+    def test_same_length_prefers_newer_timestamp(self):
+        records = [self._rec("2026-01-01T00:00:00Z", "aaa"),
+                   self._rec("2026-02-01T00:00:00Z", "bbb")]
+        result = dedup.dedupe_session(records)
+        self.assertEqual(result.kept, [1], "同长度必须选 timestamp 较新的那条")
+
+    def test_sequence_hash_must_not_decide(self):
+        # 这组数据上"序列指纹"排序会选到 timestamp 更旧的那条（旧实现就是这么错的）
+        records = [self._rec("2026-01-01T00:00:00Z", "AAA"),
+                   self._rec("2026-02-01T00:00:00Z", "DDD")]
+        self.assertEqual(dedup.dedupe_session(records).kept, [1],
+                         "并列的第二关键字是 timestamp，不是序列指纹")
+
+    def test_full_tie_keeps_lower_index(self):
+        records = [self._rec("2026-01-01T00:00:00Z", "aaa"),
+                   self._rec("2026-01-01T00:00:00Z", "bbb")]
+        result = dedup.dedupe_session(records)
+        self.assertEqual(result.kept, [0], "同长同时间必须取原下标小的那条")
+
+    def test_longer_wins_over_newer(self):
+        records = [self._rec("2026-01-01T00:00:00Z", "aaa", turns=120),
+                   self._rec("2026-12-01T00:00:00Z", "bbb", turns=100)]
+        result = dedup.dedupe_session(records)
+        self.assertEqual(result.kept, [0])
+
+    def test_tie_is_deterministic(self):
+        records = [self._rec("2026-02-01T00:00:00Z", "aaa"),
+                   self._rec("2026-02-01T00:00:00Z", "bbb"),
+                   self._rec("2026-02-01T00:00:00Z", "ccc")]
+        first = dedup.dedupe_session(records).kept
+        second = dedup.dedupe_session(list(records)).kept
+        self.assertEqual(first, second)
+        self.assertEqual(first, [0])

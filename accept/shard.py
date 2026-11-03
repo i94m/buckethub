@@ -55,6 +55,10 @@ class ShardConfig:
     #: 未切窗的完整对话。默认判为错误（下游按真实 schema 读会拿到超长记录），
     #: 一旦双方确认改口径，用这个开关放行。
     allow_top_level_window_messages: bool = False
+    #: 单条 message 自身就超 token 上限（典型是 content[] 里的图片 base64），
+    #: 切窗从物理上无解。**默认关闭**：只有显式开这个开关才降级为 warn，
+    #: 用于 B 路径的「单条 message 固有超限」口径例外；A' 路径保持严格。
+    allow_intrinsic_oversize: bool = False
     max_records_for_prefix_check: int = 200_000
 
     @property
@@ -72,6 +76,8 @@ class ShardReport:
     empty_lines: int = 0
     windowed_records: int = 0
     max_record_tokens: int = 0
+    #: 被 --allow-intrinsic-oversize 放行的「单条 message 自身超限」条数
+    intrinsic_oversize_records: int = 0
     problems: list[Problem] = field(default_factory=list)
     fingerprints: list[str] = field(default_factory=list)
     rs_ids: list[str] = field(default_factory=list)
@@ -93,6 +99,7 @@ class ShardReport:
             "tokens": self.tokens,
             "windowed_records": self.windowed_records,
             "max_record_tokens": self.max_record_tokens,
+            "intrinsic_oversize_records": self.intrinsic_oversize_records,
             "ok": self.ok,
             "problems": [p.as_dict() for p in self.problems],
         }
@@ -342,14 +349,35 @@ def check_shard(
             )
             report.unit_tokens[unit_key] = report.unit_tokens.get(unit_key, 0) + tokens
             if tokens > cfg.max_record_tokens:
-                report.problems.append(
-                    Problem(
-                        "error",
-                        where,
-                        f"单条 {tokens} token 超过上限 {cfg.max_record_tokens}"
-                        + ("（即使已切窗也超，说明窗口切得太大）" if window is not None else "，且没有窗口标记"),
+                # 两种超限要分开说：单条 message 自身超限（切窗无解，属口径例外）
+                # 与窗口整体超限（窗口切得太大，是真 bug）。
+                worst_message = 0
+                try:
+                    counts = [counter.count_messages([m]) for m in messages]
+                    worst_message = max(counts) if counts else 0
+                except Exception:
+                    worst_message = 0
+                if worst_message > cfg.max_record_tokens:
+                    text = (
+                        f"单条 message 自身超限（该 message {worst_message} token，整条 {tokens} token "
+                        f"> 上限 {cfg.max_record_tokens}；切窗无解，需口径例外）"
                     )
-                )
+                    if cfg.allow_intrinsic_oversize:
+                        report.intrinsic_oversize_records += 1
+                        report.problems.append(
+                            Problem("warn", where, text + "；已按 --allow-intrinsic-oversize 放行")
+                        )
+                    else:
+                        report.problems.append(Problem("error", where, text))
+                else:
+                    report.problems.append(
+                        Problem(
+                            "error",
+                            where,
+                            f"窗口整体超限（{tokens} token > 上限 {cfg.max_record_tokens}，窗口切得太大）"
+                            + ("" if window is not None else "，且没有窗口标记"),
+                        )
+                    )
 
     if cfg.require_trailing_newline and report.records and not ends_with_newline:
         report.problems.append(Problem("error", path.name, "末尾行没有换行结尾（文件可能被截断）"))
@@ -406,6 +434,7 @@ class DeliveryReport:
             "bytes": self.bytes,
             "tokens": self.tokens,
             "max_unit_tokens": self.max_unit_tokens,
+            "intrinsic_oversize_records": sum(s.intrinsic_oversize_records for s in self.shards),
             "ok": self.ok,
             "problems": [p.as_dict() for p in self.all_problems()],
         }

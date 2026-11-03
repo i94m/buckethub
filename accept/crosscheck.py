@@ -100,6 +100,9 @@ def scan_raw(raw_dir: Path, min_messages: int = 100) -> tuple[dict[str, FileStat
                         "key": path.name,
                         "off": here,
                         "session_id": dedup.get_session_id(record),
+                        # timestamp 必须带进 wrapper：session 并列的第二个关键字就是它，
+                        # 少了它 develop 侧按 timestamp 选、我这边只能退化成按下标选。
+                        "timestamp": str(record.get("timestamp") or ""),
                         "messages": messages,
                         "digest": _sequence_digest(dedup.get_session_id(record), messages),
                     }
@@ -107,7 +110,8 @@ def scan_raw(raw_dir: Path, min_messages: int = 100) -> tuple[dict[str, FileStat
 
     # dedup 模块吃的是"记录"（内部按 request.messages 取内容），这里包一层。
     wrapped = [
-        {"session_id": item["session_id"], "request": {"messages": item["messages"]}}
+        {"session_id": item["session_id"], "timestamp": item["timestamp"],
+         "request": {"messages": item["messages"]}}
         for item in survivors
     ]
     session_result = dedup.dedupe_session(wrapped)
@@ -202,6 +206,12 @@ def read_delivery(delivery_dir: Path, cfg: ShardConfig | None = None) -> dict[st
     return {"lines": lines, "records": merged, "window_groups": groups}
 
 
+def _basename(key: str) -> str:
+    """源对象 key 的末段。真实数据里 key 带前缀（Gpt-2026-10-18/xxx.jsonl），
+    本地 --local-dir 则是裸文件名；两侧都按末段对齐。"""
+    return str(key or "").rsplit("/", 1)[-1]
+
+
 def compare(raw_dir: Path, delivery_dir: Path, *, min_messages: int = 100,
             shard_glob: str = "deliver-*.jsonl") -> dict[str, Any]:
     my_stats, _, my_kept = scan_raw(raw_dir, min_messages=min_messages)
@@ -210,9 +220,30 @@ def compare(raw_dir: Path, delivery_dir: Path, *, min_messages: int = 100,
     manifest = ledger.load_manifest(delivery_dir / "manifest.json")
 
     # ---- 逐文件：开发侧账本 vs 独立重算 ----
+    # 开发侧的 source_key 可能是完整对象 key（带前缀），我这边按本地文件名扫；
+    # 先精确匹配，再按末段匹配。末段重名（不同前缀的同名文件）会被单独标出来，不静默串味。
+    basename_map: dict[str, str] = {}
+    ambiguous: set[str] = set()
+    for key in my_stats:
+        base = _basename(key)
+        if base in basename_map:
+            ambiguous.add(base)
+        basename_map[base] = key
+    key_matching: list[dict[str, Any]] = []
+
     per_file: list[dict[str, Any]] = []
     for file_ledger in manifest.files:
+        base = _basename(file_ledger.source_key)
         mine = my_stats.get(file_ledger.source_key)
+        matched_as = "exact" if mine is not None else ""
+        if mine is None and base not in ambiguous:
+            mine_key = basename_map.get(base)
+            mine = my_stats.get(mine_key) if mine_key else None
+            matched_as = "basename" if mine is not None else ""
+        if file_ledger.source_key != base or matched_as == "basename":
+            key_matching.append({"source_key": file_ledger.source_key,
+                                 "matched_as": matched_as or "missing",
+                                 "ambiguous_basename": base in ambiguous})
         if mine is None:
             per_file.append({"file": file_ledger.source_key, "missing_on_my_side": True})
             continue
@@ -291,6 +322,7 @@ def compare(raw_dir: Path, delivery_dir: Path, *, min_messages: int = 100,
         "window_groups": len(delivery["window_groups"]),
         "per_file_mismatches": mismatched_files,
         "files_source": manifest.files_source,
+        "key_matching": key_matching,
     }
 
 
@@ -298,6 +330,9 @@ def _print(report: dict[str, Any]) -> None:
     print(f"原始目录: {report['raw_dir']}")
     print(f"交付目录: {report['delivery_dir']}")
     print(f"逐文件账本来源: {report['files_source'] or 'manifest.files'}")
+    for item in report.get("key_matching") or []:
+        print(f"  key 对齐: {item['source_key']} → {item['matched_as']}"
+              + ("（末段重名，可能串味）" if item.get("ambiguous_basename") else ""))
     print()
     print("逐文件对比（开发侧 / 独立重算）：")
     for item in report["per_file"]:
