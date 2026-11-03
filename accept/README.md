@@ -147,8 +147,9 @@ python3 -m accept.cli verify --delivery ./out --manifest ./out/manifest.json
 python3 -m accept.cli verify --delivery ./out --execute
 python3 -m accept.cli verify --delivery ./out --execute --json --report ./accept-report.json
 
-# 3) 只重算 token（附口径反推：对前 3 条打印 4 种序列化变体的计数）
-python3 -m accept.cli recount --delivery ./out --execute --diagnose 3
+# 3) 只重算 token：默认抽样 200 条用两套独立实现互验（误差必须 0），
+#    再加 --diagnose 3 时对前 3 条打印 4 种序列化变体计数，用于反推口径
+python3 -m accept.cli recount --delivery ./out --execute --sample 200 --diagnose 3
 
 # 4) 生成一份合成样本 + 参考交付（本地测试用）
 python3 -m accept.cli fixture --out ./accept-fixture --execute
