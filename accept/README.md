@@ -325,3 +325,24 @@ python3 -m accept.crosscheck --raw-dir ./itest/raw --delivery ./itest/out
   实在对不上就用 `--report` 输出明细，按 `where` 定位。
 - **单行大于分片阈值**：`--shard-bytes` 是软上限，一条记录本身超过阈值时仍会写入并超包
   （默认 500 MB、单条 1~8 MB 时不会发生）。验收侧按硬上限检查，触发即报错。
+
+## 九、按源文件命名的交付形态（`agent/agent/accept-source-names`）
+
+开发侧改为「产物按源文件命名 + 停点在源文件边界」后，验收侧相应放开了三处写死：
+
+| 项 | 以前 | 现在 |
+| --- | --- | --- |
+| 分片 glob | `deliver-*.jsonl` | 默认 `*.jsonl`，并内建排除 `keep.jsonl` / `index.jsonl` / `ledger.json`（同一 out-dir 直接验收时不会被误当分片） |
+| 命名连续性 | 必须 `deliver-0001..N` 连号 | 按源文件命名时改查 `.part-NNNN` 从 1 连续、且不允许 `x.jsonl` 与 `x.part-0001.jsonl` 并存；旧命名仍走连号检查 |
+| 停止点 | 只认 `stop_after_record`，超出量 ≤ 单条记录 token | 新增 `stop_file`：`stop_file` 之后不允许再有源文件、停止文件本身必须有交付，超出量上界改为**停止文件自身的产出** |
+
+判定口径（文件边界停）：
+
+- 交付里出现的源文件必须全部 ≤ `stop_file`（按 key 排序比较），否则报错；
+- `stop_file` 必须真的交付了记录；
+- `delivered_tokens − target ≤ stop_file 的产出 token`（1B 目标下约 3~6%）；
+- `stop_after_record` 若存在，仍要与 journal 最后一笔一致；窗口组仍要求整组原子；
+- `stop_file` 与 `stop_after_record` 至少有一个，否则判为「无法确认停在哪」。
+
+新增回归用例：`accept/tests/test_source_names.py`（10 条，覆盖命名、part 编号、命名冲突、
+元数据文件排除、`stop_file` 合法/越界/缺字段三种情形）。

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
@@ -33,6 +34,13 @@ class ShardConfig:
     #: 允许的超标比例（只对体积，且默认 2%：切分点是"写完才判断"的普遍做法）
     shard_slack: float = 0.02
     glob: str = "deliver-*.jsonl"
+    #: 交付目录里可能混入开发侧的中间文件（同一 out-dir 直接验收时），一律不当分片
+    exclude_names: tuple[str, ...] = (
+        "keep.jsonl",
+        "index.jsonl",
+        "ledger.jsonl",
+        "delivery-manifest.json",
+    )
     require_trailing_newline: bool = True
     window_marker_keys: tuple[str, ...] = (
         "window",
@@ -403,13 +411,11 @@ class DeliveryReport:
         }
 
 
-def _shard_sort_key(path: Path) -> tuple[int, str]:
-    digits = "".join(ch for ch in path.stem if ch.isdigit())
-    return (int(digits) if digits else 0, path.name)
-
-
 def discover_shards(directory: str | Path, cfg: ShardConfig) -> list[Path]:
-    return sorted(Path(directory).glob(cfg.glob), key=_shard_sort_key)
+    excluded = {name.lower() for name in cfg.exclude_names}
+    paths = [p for p in Path(directory).glob(cfg.glob)
+             if p.name.lower() not in excluded and not p.name.startswith(".")]
+    return sorted(paths, key=lambda p: p.name)
 
 
 def check_delivery(
@@ -428,17 +434,43 @@ def check_delivery(
         )
         return report
 
-    # 命名连续性：deliver-0001 / deliver-0002 ... 不能跳号
-    numbers = [_shard_sort_key(p)[0] for p in shard_paths]
-    expected = list(range(numbers[0], numbers[0] + len(numbers)))
-    if numbers != expected:
-        report.problems.append(
-            Problem(
-                "error",
-                str(directory),
-                f"分片编号不连续: {numbers}（从 {numbers[0]} 开始应为 {expected}）",
+    # 命名连续性：按源文件命名的交付不要求编号连续，但 .part-NNNN 必须从 1 起连续
+    names = [p.name for p in shard_paths]
+    legacy_matches = [re.match(r"^deliver-(\d+)\.jsonl$", name) for name in names]
+    if all(legacy_matches):
+        numbers = [int(m.group(1)) for m in legacy_matches]
+        expected = list(range(numbers[0], numbers[0] + len(numbers)))
+        if numbers != expected:
+            report.problems.append(
+                Problem(
+                    "error",
+                    str(directory),
+                    f"分片编号不连续: {numbers}（从 {numbers[0]} 开始应为 {expected}）",
+                )
             )
-        )
+    else:
+        parts_by_stem: dict[str, list[int]] = {}
+        for name in names:
+            matched = re.match(r"^(?P<stem>.+)\.part-(?P<idx>\d{4})\.jsonl$", name)
+            if matched:
+                parts_by_stem.setdefault(matched.group("stem"), []).append(int(matched.group("idx")))
+        for stem, idxs in parts_by_stem.items():
+            if sorted(idxs) != list(range(1, len(idxs) + 1)):
+                report.problems.append(
+                    Problem(
+                        "error",
+                        str(directory),
+                        f"{stem} 的分片编号不连续: {sorted(idxs)}（应从 1 起连续）",
+                    )
+                )
+            if f"{stem}.jsonl" in names:
+                report.problems.append(
+                    Problem(
+                        "error",
+                        str(directory),
+                        f"{stem} 同时存在单片 {stem}.jsonl 与分片 .part-*（命名冲突，交付形态不唯一）",
+                    )
+                )
 
     seen_fingerprints: dict[str, str] = {}
     seen_rs: dict[str, str] = {}

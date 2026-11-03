@@ -159,7 +159,9 @@ class DevPipelineClosureTest(unittest.TestCase):
 
     # ---------------------------------------------------------------- ④ 整组原子
 
-    def test_stop_keeps_window_group_atomic(self):
+    def test_stop_at_file_boundary_keeps_window_group_atomic(self):
+        """锁定口径：停在**源文件边界**。组内的记录要么整组在、要么整组不在；
+        过线后把当前源文件剩余记录处理完即停，后续源文件一条都不碰。"""
         manifest = self._run()
         entries = [
             json.loads(line)
@@ -169,50 +171,71 @@ class DevPipelineClosureTest(unittest.TestCase):
         cumulative = 0
         before_group = None
         group = None
-        max_record_tokens = 0
         for entry in entries:
-            max_record_tokens = max(max_record_tokens, entry["tokens"])
             if entry.get("lines", 1) > 1 and group is None:
                 group = entry
                 before_group = cumulative
             cumulative += entry["tokens"]
         self.assertIsNotNone(group, "fixture 里应当有切窗记录")
+        group_key = group["key"]
 
-        # (a) 组前边界：整组都不在
+        def _group_lines(out: Path, man: dict) -> list[dict]:
+            return [
+                item for item in self._lines(out, man)
+                if "_window" in item
+                and f'{item["_window"]["source"]["key"]}#{item["_window"]["source"]["off"]}' == group["id"]
+            ]
+
+        def _assert_atomic(windowed: list[dict]) -> None:
+            groups: dict[str, list[int]] = {}
+            for item in windowed:
+                src = item["_window"]["source"]
+                groups.setdefault(f'{src["key"]}#{src["off"]}', []).append(item["_window"]["index"])
+            for key, idxs in groups.items():
+                self.assertEqual(sorted(idxs), list(range(len(idxs))),
+                                 f"{key} 的窗口不完整（整组原子被破坏）")
+
+        # (a) 目标恰在组前：文件边界停 → 该文件整份交付，组要么全在要么全不在
         boundary_out = self.root / "out_boundary"
-        manifest_boundary = self._run(target=before_group, out=boundary_out)
-        lines = self._lines(boundary_out, manifest_boundary)
-        self.assertFalse(
-            [item for item in lines if "_window" in item], "目标恰在组前，整组不应交付"
-        )
+        man = self._run(target=before_group, out=boundary_out)
+        lines = self._lines(boundary_out, man)
+        _assert_atomic([item for item in lines if "_window" in item])
+        present = _group_lines(boundary_out, man)
+        self.assertIn(len(present), (0, group["lines"]), "窗口组只落了一部分")
+        shard_keys = [s["source_key"] for s in man["shards"] if s.get("source_key")]
+        if man.get("stop_file"):
+            self.assertTrue(all(k <= man["stop_file"] for k in shard_keys),
+                            "stop_file 之后的源文件不允许出现在交付里")
+            if group_key <= man["stop_file"]:
+                self.assertEqual(len(present), group["lines"],
+                                 "组所在文件已经交付完，整组必须在")
+            else:
+                self.assertEqual(present, [], "组所在文件被停在后面，不应交付任何窗口")
+        else:
+            self.assertEqual(man["STOP_REASON"], "corpus_exhausted")
+            self.assertEqual(man["not_delivered"], 0)
         self.assertEqual(
-            manifest_boundary["not_delivered"],
-            manifest_boundary["kept_records"] - manifest_boundary["delivered_records"],
-        )
+            man["not_delivered"], man["kept_records"] - man["delivered_records"])
 
-        # (b) 组内过线：整组必须在，且停在组上
+        # (b) 组内过线：文件边界停 → 整组必须在，超出量不超过"停止文件自身的产出"
         inside_out = self.root / "out_inside"
-        manifest_inside = self._run(target=before_group + 1, out=inside_out)
-        lines = self._lines(inside_out, manifest_inside)
-        windowed = [item for item in lines if "_window" in item]
+        man_inside = self._run(target=before_group + 1, out=inside_out)
+        present = _group_lines(inside_out, man_inside)
+        self.assertEqual(len(present), group["lines"],
+                         "过线落在组内时整组必须一起落盘")
+        self.assertEqual(sorted(item["_window"]["index"] for item in present),
+                         list(range(group["lines"])))
+        self.assertEqual(man_inside["delivered_tokens"] >= before_group + 1, True)
         self.assertEqual(
-            len(windowed),
-            group["lines"],
-            "在窗口组中途过线时，整组必须一起落盘（要么全在，要么全不在）",
-        )
-        self.assertEqual(sorted(item["_window"]["index"] for item in windowed), list(range(group["lines"])))
-        self.assertEqual(manifest_inside["stop_after_record"]["id"], group["id"])
-        self.assertEqual(
-            manifest_inside["not_delivered"],
-            manifest_inside["kept_records"] - manifest_inside["delivered_records"],
-        )
-        overshoot = manifest_inside["delivered_tokens"] - (before_group + 1)
-        self.assertGreater(overshoot, 0)
-        self.assertLessEqual(
-            overshoot,
-            max_record_tokens,
-            "整组原子导致的最大超出量不应超过单条记录自身的 token",
-        )
+            man_inside["not_delivered"],
+            man_inside["kept_records"] - man_inside["delivered_records"])
+        stop_tokens = sum(s["tokens"] for s in man_inside["shards"]
+                          if s.get("source_key") == man_inside.get("stop_file"))
+        if man_inside.get("stop_file") and stop_tokens:
+            overshoot = man_inside["delivered_tokens"] - (before_group + 1)
+            self.assertLessEqual(
+                overshoot, stop_tokens,
+                "文件边界停的超出量不应超过停止文件自身的产出")
 
 
 if __name__ == "__main__":

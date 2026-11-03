@@ -190,9 +190,17 @@ class ShardLedger:
     records: int = 0
     bytes: int = 0
     tokens: int = 0
+    #: 按源文件命名时该分片属于哪个源对象（旧格式为空）
+    source_key: str = ""
+    part: int = 0
 
     def as_dict(self) -> dict[str, Any]:
-        return {"name": self.name, "records": self.records, "bytes": self.bytes, "tokens": self.tokens}
+        out = {"name": self.name, "records": self.records, "bytes": self.bytes, "tokens": self.tokens}
+        if self.source_key:
+            out["source_key"] = self.source_key
+        if self.part:
+            out["part"] = self.part
+        return out
 
 
 @dataclass
@@ -207,6 +215,10 @@ class Manifest:
     files_source: str = ""
     #: 1B 到顶时停在的那条记录（开发侧新增字段）
     stop_after_record: dict[str, Any] | None = None
+    #: 1B 到顶时停在哪一个源文件的边界上（按源文件命名的交付才有）
+    stop_file: str = ""
+    #: 逐源文件的交付状态（status / parts / records / tokens）
+    delivered_files: list[dict[str, Any]] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
@@ -220,6 +232,8 @@ class Manifest:
             "shards": [s.as_dict() for s in self.shards],
             "files_source": self.files_source,
             "stop_after_record": self.stop_after_record,
+            "stop_file": self.stop_file,
+            "delivered_files": self.delivered_files,
         }
 
 
@@ -348,6 +362,8 @@ def _shard_ledger(entry: Any) -> ShardLedger:
         records=_as_int(_pick(flat, ("records", "samples", "count", "lines", "delivered_records"), 0)),
         bytes=_as_int(_pick(flat, ("bytes", "size", "byte_size"), 0)),
         tokens=_as_int(_pick(flat, ("tokens", "token_count"), 0)),
+        source_key=str(_pick(flat, ("source_key", "source", "input_key"), "") or ""),
+        part=_as_int(_pick(flat, ("part", "part_index", "shard_part"), 0)),
     )
 
 
@@ -417,6 +433,9 @@ def normalize_manifest(raw: dict[str, Any]) -> Manifest:
     shards = [_shard_ledger(entry) for entry in shards_raw]
 
     stop_record = _pick(raw, ("stop_after_record", "stop_record", "stopped_at_record"), None)
+    delivered_files = _pick(raw, ("delivered_files", "files_delivered"), []) or []
+    if not isinstance(delivered_files, list):
+        delivered_files = []
     return Manifest(
         schema=str(_pick(raw, ("schema", "manifest_schema", "version"), "") or ""),
         stop_reason=_normalize_stop_reason(_pick(raw, ("stop_reason", "STOP_REASON", "stop"), "")),
@@ -426,6 +445,8 @@ def normalize_manifest(raw: dict[str, Any]) -> Manifest:
         files=files,
         shards=shards,
         stop_after_record=stop_record if isinstance(stop_record, dict) else None,
+        stop_file=str(_pick(raw, ("stop_file", "stopped_at_file", "stop_source"), "") or ""),
+        delivered_files=[f for f in delivered_files if isinstance(f, dict)],
         raw=raw,
     )
 

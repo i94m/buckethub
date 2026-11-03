@@ -45,17 +45,46 @@ def check_stop(manifest: Manifest, delivery: DeliveryReport, out_dir: str | Path
     target = manifest.token_target
     delivered_tokens = total.delivered_tokens or delivery.tokens
     stop_record = manifest.stop_after_record
+    stop_file = manifest.stop_file
+
+    # ---- 0) 文件边界停：停点之后不允许有任何源文件的记录 ----
+    file_tokens = 0
+    if stop_file:
+        per_file: dict[str, int] = {}
+        for shard in manifest.shards:
+            if shard.source_key:
+                per_file[shard.source_key] = per_file.get(shard.source_key, 0) + shard.tokens
+        later = sorted(k for k in per_file if k > stop_file)
+        if later:
+            problems.append(
+                Problem(
+                    "error",
+                    "manifest.stop_file",
+                    f"停在 {stop_file}，但交付里还有更后面的源文件：{later}"
+                    "（文件边界停被破坏，后续文件不该被处理）",
+                )
+            )
+        file_tokens = per_file.get(stop_file, 0)
+        if not file_tokens:
+            problems.append(
+                Problem(
+                    "error",
+                    "manifest.stop_file",
+                    f"stop_file={stop_file} 在交付里没有任何记录（停止点指向了没交付的文件）",
+                )
+            )
 
     # ---- 1) 停止点必须被记录，且能对上交付 ----
-    if not stop_record:
+    if not stop_record and not stop_file:
         problems.append(
             Problem(
                 "error",
                 "manifest.stop_after_record",
-                "声称到达 token 目标，但 manifest 没有 stop_after_record，无法确认停在哪条记录上",
+                "声称到达 token 目标，但 manifest 既没有 stop_file 也没有 stop_after_record，"
+                "无法确认停在哪条记录/哪个文件上",
             )
         )
-    else:
+    elif stop_record:
         where = f"stop_after_record:{stop_record.get('id')}"
         if stop_record.get("tokens_total_after") not in (None, delivered_tokens):
             problems.append(
@@ -123,15 +152,20 @@ def check_stop(manifest: Manifest, delivery: DeliveryReport, out_dir: str | Path
                 )
 
     # ---- 2) 超出目标的上界 ----
+    # 文件边界停的口径：上界是"停在的那个源文件自身的产出"，不是单条记录；
+    # 记录边界停（无 stop_file）仍按单条记录上界验。
     overshoot = delivered_tokens - target if target else 0
-    max_unit = delivery.max_unit_tokens
-    if target and overshoot > max_unit:
+    max_unit = file_tokens if stop_file and file_tokens else delivery.max_unit_tokens
+    if target and max_unit and overshoot > max_unit:
+        bound = (f"停止文件 {stop_file} 的产出 {file_tokens} token" if stop_file and file_tokens
+                 else f"交付集里单条记录的最大 token {max_unit}")
         problems.append(
             Problem(
                 "error",
                 "manifest.token_target",
-                f"超出目标 {overshoot} token，大于交付集里单条记录的最大 token {max_unit}"
-                "（整组原子允许超出一条记录，但不应超过这个上界）",
+                f"超出目标 {overshoot} token，大于{bound}"
+                + ("（文件边界停允许超出一个源文件，但不应超过这个上界）"
+                   if stop_file else "（整组原子允许超出一条记录，但不应超过这个上界）"),
             )
         )
 

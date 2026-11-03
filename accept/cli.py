@@ -669,7 +669,11 @@ def _add_config_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-record-tokens", type=int, default=128_000, help="单条 token 上限")
     parser.add_argument("--shard-max-mb", type=float, default=500.0, help="单包体积上限（MB）")
     parser.add_argument("--shard-slack", type=float, default=0.02, help="体积容差比例")
-    parser.add_argument("--shard-glob", default="deliver-*.jsonl", help="分片文件名模式")
+    parser.add_argument(
+        "--shard-glob",
+        default="*.jsonl",
+        help="分片文件名模式（默认匹配按源文件命名的产物；keep/index/ledger 已内建排除）",
+    )
     parser.add_argument(
         "--tokenizer",
         choices=("auto", "tiktoken", "chars"),
@@ -695,6 +699,7 @@ def _cmd_verify(args: argparse.Namespace) -> int:
         print(f"  交付目录: {args.delivery}")
         print(f"  manifest : {args.manifest or Path(args.delivery) / 'manifest.json'}")
         print(f"  分片模式 : {cfg.glob}，单包上限 {cfg.shard_max_bytes} 字节（容差 {cfg.shard_slack:.0%}）")
+        print(f"  排除名单 : {', '.join(cfg.exclude_names)}")
         print(f"  单条上限 : {cfg.max_record_tokens} token，messages ≥ {cfg.min_messages}")
         print("  将执行   : 逐文件对账 / 分片完整性 / token 复算 / 交付集前缀不变量 / 分片与 manifest 交叉核对")
         info = tokens.tokenizer_info()
@@ -778,7 +783,10 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--report", default=None, help="把报告写到该路径（需 --execute）")
 
     verify = sub.add_parser("verify", parents=[common], help="全量验收：对账 + 分片完整性 + token 复算")
-    verify.add_argument("--delivery", required=True, help="交付目录（含 manifest.json 和 deliver-*.jsonl）")
+    verify.add_argument(
+        "--delivery", required=True,
+        help="交付目录（含 manifest.json；分片为 <源文件>.jsonl 或 <源文件>.part-NNNN.jsonl）",
+    )
     verify.add_argument("--manifest", default=None, help="manifest 路径，默认 <delivery>/manifest.json")
     verify.add_argument("--skip-prefix-invariant", action="store_true", help="跳过交付集前缀不变量")
     verify.add_argument("--allow-missing-steps", action="store_true", help="允许 manifest 缺某一步的记账")
