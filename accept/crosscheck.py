@@ -10,6 +10,13 @@
 只读本地目录，不联网、不写任何交付物（除 `--report` 指定的 JSON）。
 
     python3 -m accept.crosscheck --raw-dir ./itest/raw --delivery ./itest/out
+
+按源文件命名的交付（`<源文件>.jsonl` / `.part-NNNN.jsonl`）要显式给 glob——
+默认值保持 `deliver-*.jsonl` 不放宽，避免把同目录的 `index.jsonl` / `keep.jsonl`
+当成交付分片吸进来：
+
+    python3 -m accept.crosscheck --raw-dir ./itest/raw --delivery ./itest/out \
+        --shard-glob 'gpt-*.jsonl'
 """
 
 from __future__ import annotations
@@ -195,9 +202,11 @@ def read_delivery(delivery_dir: Path, cfg: ShardConfig | None = None) -> dict[st
     return {"lines": lines, "records": merged, "window_groups": groups}
 
 
-def compare(raw_dir: Path, delivery_dir: Path, *, min_messages: int = 100) -> dict[str, Any]:
+def compare(raw_dir: Path, delivery_dir: Path, *, min_messages: int = 100,
+            shard_glob: str = "deliver-*.jsonl") -> dict[str, Any]:
     my_stats, _, my_kept = scan_raw(raw_dir, min_messages=min_messages)
-    delivery = read_delivery(delivery_dir)
+    cfg = ShardConfig(glob=shard_glob)
+    delivery = read_delivery(delivery_dir, cfg)
     manifest = ledger.load_manifest(delivery_dir / "manifest.json")
 
     # ---- 逐文件：开发侧账本 vs 独立重算 ----
@@ -333,11 +342,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--raw-dir", required=True, help="原始 jsonl 所在目录（本地合成数据）")
     parser.add_argument("--delivery", required=True, help="开发侧产出目录（含 manifest.json）")
     parser.add_argument("--min-messages", type=int, default=100)
+    parser.add_argument(
+        "--shard-glob",
+        default="deliver-*.jsonl",
+        help="交付分片文件名模式（默认 deliver-*.jsonl，保持旧行为；按源文件命名时传 'gpt-*.jsonl'）",
+    )
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--report", default=None, help="把对比结果写成 JSON")
     args = parser.parse_args(argv)
 
-    report = compare(Path(args.raw_dir), Path(args.delivery), min_messages=args.min_messages)
+    report = compare(Path(args.raw_dir), Path(args.delivery), min_messages=args.min_messages,
+                     shard_glob=args.shard_glob)
     if args.report:
         Path(args.report).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     if args.json:

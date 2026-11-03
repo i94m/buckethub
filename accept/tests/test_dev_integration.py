@@ -16,7 +16,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from accept import synth, tokens
+from accept import cli, crosscheck, shard, synth, tokens
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PIPELINE = Path(
@@ -240,3 +240,142 @@ class DevPipelineClosureTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------- 多源 + 目标停
+# 2026-11-03 P1-1 回归：逐文件账本必须闭合。
+# 修前形态：停止点之后的文件 delivered=0、kept 未记 → accept 判「该文件去重后应保留 N 条，
+# 但交付条数记的是 0——交付计数没有回写账本」。修后：kept_records / not_delivered / status
+# 三个字段补齐，verify 直接绿。
+
+
+class MultiSourceStopLedgerTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.raw = self.root / "raw"
+        self.raw.mkdir()
+        # 3 个源文件，每个 2 条 100 轮记录（互不构成 session/前缀关系）
+        for index in range(3):
+            path = self.raw / f"gpt-gate-{index:04d}.jsonl"
+            with open(path, "w", encoding="utf-8") as handle:
+                for j in range(2):
+                    record = synth.record(
+                        session_uuid=f"gate-{index}-{j}",
+                        messages=synth.dialog(100, prefix=f"G{index}-{j}"),
+                        user_hash=f"u{index}-{j}",
+                        rs_id=f"rs_{index}{j:03d}",
+                    )
+                    handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+        self.out = self.root / "out"
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _run(self, *extra: str):
+        cmd = [
+            sys.executable, str(PIPELINE), "--execute",
+            "--local-dir", str(self.raw), "--out-dir", str(self.out),
+            # 关掉 index 闸门，保证三个文件都被索引（真实运行里闸门会留下未交付文件，
+            # 这里要复现的正是"已索引但没交付"的账本形态）
+            "--tokens-per-byte", "0",
+            *extra,
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
+        return json.loads((self.out / "manifest.json").read_text(encoding="utf-8"))
+
+    def test_ledger_fields_are_complete(self):
+        manifest = self._run("--target-tokens", "1")
+        self.assertEqual(manifest["STOP_REASON"], "token_target_reached")
+        self.assertEqual(manifest["stop_file"], "gpt-gate-0000.jsonl")
+
+        payload = json.loads((self.out / "ledger.json").read_text(encoding="utf-8"))
+        files = payload["files"]
+        self.assertEqual(len(files), 3)
+        for key, row in files.items():
+            self.assertIn("kept_records", row, f"{key} 缺 kept_records")
+            self.assertIn("not_delivered", row, f"{key} 缺 not_delivered")
+            self.assertIn("status", row, f"{key} 缺 status")
+            self.assertEqual(
+                row["kept_records"],
+                row["passed"] - row["session_removed"] - row["prefix_removed"],
+                f"{key} 的 kept_records 与 passed−移除量 不一致",
+            )
+            self.assertEqual(row["not_delivered"], row["kept_records"] - row["delivered_records"])
+            self.assertEqual(
+                row["scanned"],
+                row["removed_total"] if "removed_total" in row else sum(
+                    row[k] for k in ("parse_error", "no_session_id", "no_rs_id",
+                                     "no_encrypted_content", "too_short")
+                    if k in row
+                ) + row["session_removed"] + row["prefix_removed"]
+                + row["delivered_records"] + row["not_delivered"],
+                f"{key} 账本不闭合",
+            )
+            # accept 把 stop_cut 当 not_delivered 的别名，写了就双重计数
+            self.assertNotIn("stop_cut", row)
+            self.assertNotIn("stop_cut", row.get("removed", {}))
+
+        statuses = sorted(row["status"] for row in files.values())
+        self.assertEqual(statuses, ["delivered", "not_reached", "not_reached"])
+
+    def test_verify_is_green_with_multi_source_stop(self):
+        self._run("--target-tokens", "1")
+        report = cli.run_verify(
+            self.out,
+            manifest_path=None,
+            counter=cli._Counter(),
+            cfg=shard.ShardConfig(glob="*.jsonl"),
+        )
+        errors = [p for p in report["problems"] if p["level"] == "error"]
+        self.assertEqual(errors, [], f"verify 不该报错：{errors}")
+        self.assertTrue(report["ok"])
+
+
+class CrosscheckGlobTest(unittest.TestCase):
+    """P1-2：crosscheck 可显式指定 glob，默认值保持 deliver-*.jsonl 不放宽。"""
+
+    def setUp(self) -> None:
+        self._tmp = TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.raw = self.root / "raw"
+        self.raw.mkdir()
+        for j in range(2):
+            record = synth.record(
+                session_uuid=f"cc-{j}",
+                messages=synth.dialog(100, prefix=f"CC{j}"),
+                user_hash=f"cc{j}",
+                rs_id=f"rs_cc{j}",
+            )
+            with open(self.raw / "gpt-cc-0001.jsonl", "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+        self.out = self.root / "out"
+        proc = subprocess.run(
+            [sys.executable, str(PIPELINE), "--execute", "--local-dir", str(self.raw),
+             "--out-dir", str(self.out), "--target-tokens", "1000000000"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_explicit_glob_matches_source_named_delivery(self):
+        report = crosscheck.compare(self.raw, self.out, shard_glob="gpt-*.jsonl")
+        self.assertTrue(report["kept"]["digests_match"], report["kept"])
+        self.assertEqual(report["tokens"]["delta"], 0)
+        self.assertEqual(report["per_file_mismatches"], [])
+
+    def test_default_glob_is_unchanged(self):
+        # 默认 glob 只认 deliver-*.jsonl；按源文件命名时应当"什么也没读到"而不是误吸
+        report = crosscheck.compare(self.raw, self.out)
+        self.assertEqual(report["delivery_lines"], 0)
+        self.assertFalse(report["kept"]["digests_match"])
+
+    def test_cli_flag_is_wired(self):
+        code = crosscheck.main([
+            "--raw-dir", str(self.raw), "--delivery", str(self.out),
+            "--shard-glob", "gpt-*.jsonl",
+        ])
+        self.assertEqual(code, 0)

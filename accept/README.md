@@ -346,3 +346,31 @@ python3 -m accept.crosscheck --raw-dir ./itest/raw --delivery ./itest/out
 
 新增回归用例：`accept/tests/test_source_names.py`（10 条，覆盖命名、part 编号、命名冲突、
 元数据文件排除、`stop_file` 合法/越界/缺字段三种情形）。
+
+## 十、逐文件账本字段（`ledger.json`，与开发侧同一份契约）
+
+验收侧对账恒等式是 `原始 = 各移除步骤 + 交付 + 停止后未交付`，所以开发侧每个文件必须带：
+
+| 字段 | 用途 |
+| --- | --- |
+| `kept_records` | 去重后应保留条数；缺了就会报「该文件去重后应保留 N 条，但交付条数记的是 0」 |
+| `not_delivered` | 停止点之后没交付的条数；缺了逐文件恒等式两边对不上 |
+| `status` | `delivered` / `zero_kept` / `not_reached`（已索引、被文件边界停挡在后面） |
+
+**`stop_cut` 禁用**：它被归到 `not_delivered` 的别名，两边同时写就是双重计数。
+验收侧一见到 `stop_cut` 与 `not_delivered` 同时出现就会加总两次并对不上，这是刻意的 fail-closed。
+
+`shards[].source_key` 必填；它与 `stop_file` 同属「源对象 key」命名空间，按字符串序比较。
+
+## 十一、`--shard-glob`
+
+`verify` / `recount` 默认 `*.jsonl`（内建排除 `keep.jsonl` / `index.jsonl` / `ledger.json`）；
+**`crosscheck` 默认仍是 `deliver-*.jsonl`**，不放宽——它扫的是开发侧 out-dir，那里住着
+`index.jsonl` / `keep.jsonl`，放宽默认值会把它们当成交付分片。按源文件命名时显式传：
+
+```bash
+python -m accept.crosscheck --raw-dir <RAW> --delivery <OUT> --shard-glob 'gpt-*.jsonl'
+```
+
+`.part-NNNN` 从 0001 起、首片也带后缀；`<主干>.jsonl` 与 `<主干>.part-0001.jsonl` 不允许并存
+（验收侧会报「命名冲突，交付形态不唯一」）。
