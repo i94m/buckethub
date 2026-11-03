@@ -545,3 +545,53 @@ class TestRegressionDeliveredLedger(_PipelineCase):
         self.assertEqual(per_file_windows, man["delivered_samples"])
         self.assertEqual(man["ledger"]["delivered_records"], man["delivered_records"])
         self.assertEqual(man["ledger"]["delivered_windows"], man["delivered_samples"])
+
+
+# ---------------------------------------------------------------- 分块 Range GET 读取
+
+class _FakeS3:
+    """只实现 get_object(Range=...) 的最小 S3 桩，用于验证分块读取。"""
+
+    def __init__(self, data: bytes, short_read_at=None):
+        self.data = data
+        self.calls = []
+        self.short_read_at = short_read_at
+
+    def get_object(self, Bucket, Key, Range):
+        assert Range.startswith("bytes=")
+        start, end = (int(x) for x in Range[6:].split("-"))
+        chunk = self.data[start:end + 1]
+        if self.short_read_at is not None and len(self.calls) == self.short_read_at:
+            chunk = chunk[: max(1, len(chunk) // 2)]      # 模拟短读
+        self.calls.append((start, end))
+        return {"Body": __import__("io").BytesIO(chunk)}
+
+
+class TestRangedReader(unittest.TestCase):
+    def test_ranged_reader_matches_sequential(self):
+        from types import SimpleNamespace
+        rows = [json.dumps({"i": i, "text": "中文-" + "x" * (i % 37)}, ensure_ascii=False).encode() for i in range(200)]
+        data = b"\n".join(rows) + b"\n"
+        args = SimpleNamespace(bucket="b", chunk_mb=0, workers=4)
+        stats = {"requests": 0, "retries": 0, "timeouts": 0, "bytes": 0, "max_chunk": 0}
+        got = list(cp.iter_record_bytes_ranged(args, _FakeS3(data), "k", len(data), stats,
+                                              chunk_bytes=97, workers=4))
+        self.assertEqual(len(got), len(rows))
+        # offset 必须是真实字节偏移，raw 必须逐字节等于原行
+        expect_off = 0
+        for (off, raw), row in zip(got, rows):
+            self.assertEqual(off, expect_off)
+            self.assertEqual(raw, row + b"\n")
+            expect_off += len(raw)
+        self.assertEqual(expect_off, len(data))
+        self.assertGreater(stats["requests"], 1)          # 确实是分块拉的，不是整文件
+
+    def test_ranged_reader_retries_short_read(self):
+        from types import SimpleNamespace
+        data = b"a" * 1000
+        args = SimpleNamespace(bucket="b", chunk_mb=0, workers=2)
+        stats = {"requests": 0, "retries": 0, "timeouts": 0, "bytes": 0, "max_chunk": 0}
+        got = list(cp.iter_record_bytes_ranged(args, _FakeS3(data, short_read_at=0), "k", len(data),
+                                              stats, chunk_bytes=300, workers=2))
+        self.assertEqual(b"".join(raw for _, raw in got), data)
+        self.assertGreaterEqual(stats["retries"], 1)

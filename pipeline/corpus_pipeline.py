@@ -243,10 +243,15 @@ def make_client(args):
 def list_sources(args, client):
     """返回 [(key, size)]。来源三选一：--keys / --keys-file / 前缀列举。"""
     if args.keys:
-        return [(k, None) for k in args.keys]
-    if args.keys_file:
+        keys = list(args.keys)
+    elif args.keys_file:
         keys = [ln.strip() for ln in Path(args.keys_file).read_text().splitlines() if ln.strip()]
-        return [(k, None) for k in keys]
+    else:
+        keys = None
+    if keys is not None:
+        # 显式给了 key 也要拿 ContentLength，否则 index 会退化成"整文件单流"，无法分块并发
+        return [(k, (client.head_object(Bucket=args.bucket, Key=k)["ContentLength"] if client else None))
+                for k in keys]
     if args.local_dir:
         base = Path(args.local_dir)
         return [(str(p.name), p.stat().st_size) for p in sorted(base.glob("*.jsonl"))]
@@ -287,6 +292,65 @@ def iter_record_bytes(args, client, key):
             offset += len(raw)
     finally:
         stream.close()
+
+
+def iter_record_bytes_ranged(args, client, key, size, stats, chunk_bytes=None, workers=None):
+    """并行 Range GET 分块读取：单次请求 chunk_bytes，同时在飞 workers 块，按顺序拼行。
+
+    跨块的半行用 carry 串起来，保证 (offset, raw) 与顺序读完全一致。
+    """
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    chunk = chunk_bytes or args.chunk_mb * 1024 * 1024
+    workers = workers or args.workers
+    nchunks = (size + chunk - 1) // chunk
+    lock = threading.Lock()
+
+    def fetch(i):
+        start = i * chunk
+        end = min(size, start + chunk) - 1
+        last = None
+        for attempt in range(4):
+            try:
+                body = client.get_object(Bucket=args.bucket, Key=key,
+                                         Range=f"bytes={start}-{end}")["Body"]
+                data = body.read()
+                if len(data) != end - start + 1:
+                    raise IOError(f"short read {len(data)} != {end - start + 1}")
+                with lock:
+                    stats["requests"] += 1
+                    stats["bytes"] += len(data)
+                    stats["max_chunk"] = max(stats["max_chunk"], len(data))
+                return data
+            except Exception as exc:            # 超时 / 限流 / 短读都重试
+                last = exc
+                with lock:
+                    stats["retries"] += 1
+                    if "timeout" in str(exc).lower() or "timed out" in str(exc).lower():
+                        stats["timeouts"] += 1
+                print(f"[range] 重试 chunk {i}: {type(exc).__name__}: {exc}", flush=True)
+                time.sleep(1.5 * (attempt + 1))
+        raise last
+
+    carry = b""
+    offset = 0
+    with ThreadPoolExecutor(workers) as ex:
+        pending, submit = {}, 0
+        for i in range(nchunks):
+            while submit < nchunks and submit <= i + workers - 1:
+                pending[submit] = ex.submit(fetch, submit)
+                submit += 1
+            data = pending.pop(i).result()
+            buf = carry + data if carry else data
+            lines = buf.split(b"\n")
+            carry = lines.pop()
+            for ln in lines:
+                raw = ln + b"\n"
+                yield offset, raw
+                offset += len(raw)
+    if carry:
+        yield offset, carry
 
 
 def read_range(args, client, key, offset, length) -> bytes:
@@ -339,7 +403,15 @@ def phase_index(args, state, ledger, out_dir: Path):
             t0 = time.time()
             row = ledger.file(key)
             scanned_in_file = 0
-            for offset, raw in iter_record_bytes(args, client, key):
+            stats = {"requests": 0, "retries": 0, "timeouts": 0, "bytes": 0, "max_chunk": 0}
+            if args.local_dir or not size:
+                stream = iter_record_bytes(args, client, key)
+            else:
+                nch = (size + args.chunk_mb * 1024 * 1024 - 1) // (args.chunk_mb * 1024 * 1024)
+                print(f"[index] {key}: {size/1024**3:.2f} GiB，按 {args.chunk_mb} MB × {args.workers} 并发 "
+                      f"分 {nch} 块 Range GET", flush=True)
+                stream = iter_record_bytes_ranged(args, client, key, size, stats)
+            for offset, raw in stream:
                 scanned_in_file += 1
                 if args.max_records and scanned_in_file > args.max_records:
                     break
@@ -367,11 +439,16 @@ def phase_index(args, state, ledger, out_dir: Path):
                 new_index.append(item)
                 out.write(json.dumps(item, ensure_ascii=False) + "\n")
             out.flush()
+            el = time.time() - t0
             state.data["index"]["done"].append(key)
             state.data["index"]["files"][key] = {"scanned": scanned_in_file,
-                                                 "elapsed_s": round(time.time() - t0, 1)}
+                                                 "elapsed_s": round(el, 1), "stats": stats}
             state.save()
-            print(f"[index] {key}: 扫描 {scanned_in_file} 条，通过 {row['passed']}，{time.time()-t0:.0f}s")
+            rate = stats["bytes"] / 1e6 / el if el else 0
+            print(f"[index] {key}: 扫描 {scanned_in_file} 条，通过 {row['passed']}，{el:.0f}s，"
+                  f"{stats['bytes']/1e6:.0f} MB / {stats['requests']} 次 Range GET / "
+                  f"重试 {stats['retries']}（超时 {stats['timeouts']}）/ {rate:.1f} MB/s / "
+                  f"最大单块 {stats['max_chunk']/1e6:.0f} MB", flush=True)
 
             # 提前止损：按实测 token/byte 预估保留集，过线就不再拉新文件
             projected = project_kept_tokens(idx_path, args.tokens_per_byte)
@@ -644,6 +721,8 @@ def build_parser(argv=None):
     ap.add_argument("--keys", nargs="*", default=[])
     ap.add_argument("--keys-file")
     ap.add_argument("--local-dir", help="本地目录模式（离线自测用，不连 B2）")
+    ap.add_argument("--chunk-mb", type=int, default=16, help="index 阶段单次 Range GET 的块大小（MB）")
+    ap.add_argument("--workers", type=int, default=8, help="index 阶段并发 Range GET 数")
     ap.add_argument("--max-records", type=int, default=0, help="每个文件最多扫描多少条（0=全部，自测用）")
     ap.add_argument("--min-messages", type=int, default=MIN_MESSAGES)
     ap.add_argument("--max-sample-tokens", type=int, default=MAX_SAMPLE_TOKENS)
