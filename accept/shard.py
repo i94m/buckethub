@@ -69,6 +69,8 @@ class ShardReport:
     rs_ids: list[str] = field(default_factory=list)
     window_rs_ids: list[str] = field(default_factory=list)
     windowing: list[tuple[str, int, int, int, Any]] = field(default_factory=list)
+    #: 交付单元的 token：非切窗记录按行，切窗记录按 source 聚合（整组算一条）
+    unit_tokens: dict[str, int] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -325,6 +327,12 @@ def check_shard(
                 continue
             report.tokens += tokens
             report.max_record_tokens = max(report.max_record_tokens, tokens)
+            unit_key = (
+                f"window:{window.get('fingerprint')}"
+                if window is not None and window.get("fingerprint")
+                else f"line:{path.name}:{lineno}"
+            )
+            report.unit_tokens[unit_key] = report.unit_tokens.get(unit_key, 0) + tokens
             if tokens > cfg.max_record_tokens:
                 report.problems.append(
                     Problem(
@@ -351,6 +359,14 @@ class DeliveryReport:
     directory: str
     shards: list[ShardReport] = field(default_factory=list)
     problems: list[Problem] = field(default_factory=list)
+    #: 交付单元（源记录粒度）的 token，切窗组已按 source 合并
+    unit_tokens: dict[str, int] = field(default_factory=dict)
+    #: 切窗指纹 → 已交付的窗口下标
+    window_index_map: dict[str, list[int]] = field(default_factory=dict)
+
+    @property
+    def max_unit_tokens(self) -> int:
+        return max(self.unit_tokens.values()) if self.unit_tokens else 0
 
     @property
     def records(self) -> int:
@@ -381,6 +397,7 @@ class DeliveryReport:
             "records": self.records,
             "bytes": self.bytes,
             "tokens": self.tokens,
+            "max_unit_tokens": self.max_unit_tokens,
             "ok": self.ok,
             "problems": [p.as_dict() for p in self.all_problems()],
         }
@@ -458,6 +475,10 @@ def check_delivery(
             window_groups.setdefault(fingerprint, []).append(
                 (path.name, index, count, n_messages, messages_total)
             )
+            if fingerprint:
+                report.window_index_map.setdefault(fingerprint, []).append(index)
+        for unit_key, unit_tokens in shard.unit_tokens.items():
+            report.unit_tokens[unit_key] = report.unit_tokens.get(unit_key, 0) + unit_tokens
 
     for rs_id, where in seen_window_rs.items():
         if rs_id in seen_rs:

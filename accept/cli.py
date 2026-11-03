@@ -18,7 +18,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Sequence
 
-from . import dedup, ledger, reference, shard, synth, tokens
+from . import dedup, ledger, reference, shard, stopcheck, synth, tokens
 from .ledger import Problem
 
 EXIT_OK = 0
@@ -211,6 +211,13 @@ def run_verify(
     }
 
     if manifest is not None:
+        stop_problems = stopcheck.check_stop(manifest, delivery, delivery_dir)
+        problems.extend(stop_problems)
+        checks["stop_atomic"] = {
+            "ok": _problems_ok(stop_problems),
+            "detail": "到顶即停：整组窗口原子、停止点可追溯、超出量 ≤ 单条记录 token、未交付条数闭合",
+        }
+
         cross_problems = _cross_check_shards(manifest, delivery)
         problems.extend(cross_problems)
         checks["shard_vs_manifest"] = {

@@ -205,6 +205,8 @@ class Manifest:
     files: list[FileLedger] = field(default_factory=list)
     shards: list[ShardLedger] = field(default_factory=list)
     files_source: str = ""
+    #: 1B 到顶时停在的那条记录（开发侧新增字段）
+    stop_after_record: dict[str, Any] | None = None
     raw: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
@@ -217,6 +219,7 @@ class Manifest:
             "files": [f.as_dict() for f in self.files],
             "shards": [s.as_dict() for s in self.shards],
             "files_source": self.files_source,
+            "stop_after_record": self.stop_after_record,
         }
 
 
@@ -413,6 +416,7 @@ def normalize_manifest(raw: dict[str, Any]) -> Manifest:
         shards_raw = []
     shards = [_shard_ledger(entry) for entry in shards_raw]
 
+    stop_record = _pick(raw, ("stop_after_record", "stop_record", "stopped_at_record"), None)
     return Manifest(
         schema=str(_pick(raw, ("schema", "manifest_schema", "version"), "") or ""),
         stop_reason=_normalize_stop_reason(_pick(raw, ("stop_reason", "STOP_REASON", "stop"), "")),
@@ -421,6 +425,7 @@ def normalize_manifest(raw: dict[str, Any]) -> Manifest:
         total=total,
         files=files,
         shards=shards,
+        stop_after_record=stop_record if isinstance(stop_record, dict) else None,
         raw=raw,
     )
 

@@ -125,13 +125,30 @@
 - 分片行数 = `delivered_records + window_pieces`（切窗片段是额外行）。
 - `stop_cut` 只在"1B 到达即停"时出现，记录停止后没交付的那部分，否则对账不闭合。
 
-### 2.4 到达 1B 即停的记账方式
+### 2.4 到达 1B 即停：整组原子
 
 - `stop_reason = "token_target_reached"`，且 `total.delivered_tokens ≥ token_target`
   （小于目标就声称到达，判错）。
-- 最多一个文件标 `status: "done_partial"`，而且它必须是 `files[]` 里**最后一个**
-  （停止后不该再拉新文件；没拉的文件不要写进 manifest）。
-- 该文件里停止之后的记录记进 `stop_cut`。
+- **最小提交单位是一条记录的全部窗口**：过线时这一组要么全落盘、要么全不落，
+  不允许 `window 0 of 2` 已交付、`1 of 2` 被丢掉。交付里任何窗口组的
+  `index` 都必须正好覆盖 `0..of-1`（分片检查统一校验）。
+- `manifest.stop_after_record` 必须存在，且与 `emit.journal` 最后一笔、
+  与 `delivered_tokens` 对得上：
+
+```json
+"stop_after_record": {"id": "Gpt-…/x.jsonl#123603", "key": "Gpt-…/x.jsonl", "off": 123603,
+                      "n_msgs": 260, "windows": 2, "tokens": 186022,
+                      "tokens_total_after": 215506}
+```
+
+- **允许超出目标，但有上界**：整组原子提交会让 `delivered_tokens` 最多超出
+  "这一条记录自身的 token 量"。验收按 `delivered_tokens − token_target ≤
+  交付集里单条记录的最大 token` 校验（等价于"≤ 前缀去重后单条最大 token"），
+  超出这个上界说明不是整组原子造成的，判错。
+- 未交付部分：`not_delivered = kept_records − delivered_records` 必须闭合。
+  逐文件记不了可以只记总量，此时各文件差额合计必须等于 `not_delivered`（降级为 warn）。
+- 最多一个文件标 `status: "done_partial"` 且必须是 `files[]` 最后一个
+  （没拉取的文件不要写进 manifest）。
 
 ---
 
@@ -144,6 +161,7 @@
 | token 复算 | `accept/tokens.py` 两套独立序列化 + tiktoken，逐片比对 manifest | 是（误差必须 0） |
 | 对账 | `accept/ledger.py` 逐文件恒等式 + 总量/分片交叉核对 | 是 |
 | 分片完整性 | `accept/shard.py` 逐行 `json.loads`、末尾完整、体积、单条 token、rs_id、密文、切窗覆盖 | 是 |
+| 1B 即停原子性 | `accept/stopcheck.py` 整组窗口完整性、停止点可追溯、超出量上界、未交付闭合 | 是 |
 | 两侧交叉验证 | `accept/crosscheck.py` 用独立实现从原始 jsonl 重算，对比开发侧账本与交付内容 | 是 |
 
 ---
@@ -218,10 +236,19 @@ python3 -m unittest discover -s accept/tests -t .
 | `tests/test_e2e.py` | 合成 → 参考交付 → 全量验收通过、逐文件对账闭合、可复现、体积切分、1B 即停记账、**dry-run 不读不写** |
 
 另有 `tests/test_dev_format.py`（11 例）专门锁住开发侧实际格式：`ledger.json` sidecar、
-`_window` 的 `of`/`source`、窗口内容位置、窗口覆盖完整性、停止后未交付的归属。
+`_window` 的 `of`/`source`、窗口内容位置、窗口覆盖完整性、停止后未交付的归属；
+`tests/test_stopcheck.py`（11 例）锁住 1B 即停的四条判据（缺 stop_after_record、
+与 journal 不一致、窗口组不完整、超出上界、未交付不闭合都必须报错）。
+
+`tests/test_dev_integration.py`（4 例）是**真联调**：直接 subprocess 跑开发侧
+`pipeline/corpus_pipeline.py`（合并进本分支后自动生效，也可用环境变量
+`CORPUS_PIPELINE=/path/to/corpus_pipeline.py` 指过去），断言窗口写回
+`request.messages` 且可还原、逐文件交付计数闭合、连跑三次幂等、窗口组整组原子
+与超出上界。这组用例在修复前的 `2b954a1` 上 **4 条全红**，修复后全绿。
 
 `tiktoken` 缺失时，依赖真分词的用例自动 skip，其余全跑——这是刻意的：
-记账/切片/去重这些逻辑不该被"没装包"挡住。装好后跑全绿（99 例，0 skip）。
+记账/切片/去重这些逻辑不该被"没装包"挡住。装好后全绿：不带开发侧流水线时
+103 例，带上联调用例共 **114 例、0 skip**。
 
 ---
 
@@ -245,16 +272,21 @@ python3 -m unittest discover -s accept/tests -t .
 
 | 项 | 开发侧实际 | 验收侧处理 |
 | --- | --- | --- |
-| manifest 顶层 | `STOP_REASON` / `delivered_tokens` / `delivered_samples` / `kept_records` / `delivered_records` / `not_delivered` / `shards` / `config` / `ledger` | 别名归一 |
-| 逐文件明细 | 不在 manifest 里，在同目录 `ledger.json` 的 `files{}`，字段扁平 | 自动读 sidecar，扁平字段按关键词归类 |
+| manifest 顶层 | `STOP_REASON` / `delivered_tokens` / `delivered_samples` / `kept_records` / `delivered_records` / `not_delivered` / `shards` / `config` / `ledger` / `stop_after_record` | 别名归一 |
+| 逐文件明细 | 不在 manifest 里，在同目录 `ledger.json` 的 `files{}`，字段扁平 | 自动读 sidecar |
 | 过滤步骤 | 多一个 `no_session_id` | 作为可选步骤 `filter_no_session_id` 纳入对账 |
 | 停止原因 | `corpus_exhausted` | 归一为 `source_exhausted` |
 | 分片清单 | `{file, samples, bytes, tokens}` | `samples` 视为行数 |
 | tokenizer | 只写了 `config.tokenizer = o200k_base` | 从 config 取编码器；方法按锁定口径（`encode_ordinary`） |
 | 切窗标记 | `_window{index, of, source{key,off}, messages_total}` | `of`→`count`，`source.key#off` 当指纹 |
-| 窗口内容 | 顶层 `messages` | 默认报错；`--allow-top-level-window-messages` 可放行 |
+| 窗口内容 | 写在 `request.messages`（`ac0c81b` 起） | 与未切窗记录同一读取路径，直接校验 |
+| 停止点 | `stop_after_record{id,key,off,n_msgs,windows,tokens,tokens_total_after}` | 与 journal 最后一笔、交付 token 交叉核对 |
 | 未交付 | 只有总量 `not_delivered` | 逐文件差额合计与总量一致时降级为 warn |
 | 交付行数 | `delivered_samples`（行）/ `delivered_records`（源记录） | 分片行数按 `delivered_samples` 校验 |
+
+历史包袱：`2b954a1` 把窗口写在顶层 `messages`，验收侧默认判错，
+`--allow-top-level-window-messages` 可以放行——但 `ac0c81b` 已按裁决改回
+`request.messages`，正常不该再用这个开关。
 
 ### 逐项交叉验证（`accept/crosscheck.py`）
 
@@ -266,9 +298,21 @@ python3 -m accept.crosscheck --raw-dir ./itest/raw --delivery ./itest/out
 
 - 逐文件：扫描数、各过滤原因、session 移除、前缀移除、保留数（开发侧账本 vs 独立重算）；
 - 交付集：把分片内容按 `_window` 合并后与独立算出的保留集按**内容摘要**比对；
+  提前停止时"缺的条数"必须正好等于 `not_delivered`；
 - token：交付复算 vs manifest 声明，误差必须 0。
 
-对联调数据的实测结论：逐文件计数逐项一致、保留集 12 条缺 0 多 0、token 误差 0。
+`ac0c81b` 上的实测（同一套合成 fixture，33 条原始 / 12 条保留）：
+
+| 场景 | 逐文件计数 | 保留集 | token 复算 | verify |
+| --- | --- | --- | --- | --- |
+| 全量跑完 | 一致 | 12 / 12，缺 0 多 0 | 218,416 / 218,416，误差 0 | 全绿 |
+| 多窗口（20k 阈值切成 10 片） | 一致 | 12 / 12，缺 0 多 0 | 218,416 / 218,416，误差 0 | 全绿 |
+| 停在窗口组前（target=组前累计） | 一致 | 12 / 10，缺 2 = not_delivered 2 | 29,484 / 29,484，误差 0 | 全绿 |
+| 停在窗口组中间（target=组前+1） | 一致 | 12 / 11，缺 1 = not_delivered 1 | 215,506 / 215,506，误差 0 | 全绿 |
+
+停止场景实测的超出量：组前边界 0、组内过线 186,021、组尾 1、组中 93,011，
+均 ≤ 该条记录自身 186,022 token，**"最多超一条记录的 token 量"这个上界成立**。
+连跑三次 `session_removed` / `prefix_removed` / 逐文件交付条数完全不变。
 
 ## 八、已知边界
 

@@ -234,6 +234,8 @@ def compare(raw_dir: Path, delivery_dir: Path, *, min_messages: int = 100) -> di
     theirs_digests = [item["digest"] for item in delivery["records"]]
     missing = sorted(set(mine_digests) - set(theirs_digests))
     extra = sorted(set(theirs_digests) - set(mine_digests))
+    # 到达目标后提前停止时，保留集里本来就会有一部分没交付；差额必须正好等于 not_delivered
+    expected_missing = manifest.total.not_delivered
 
     # ---- token 复算 ----
     recounted = sum(tokens.count_messages(item["messages"]) for item in delivery["records"])
@@ -263,7 +265,12 @@ def compare(raw_dir: Path, delivery_dir: Path, *, min_messages: int = 100) -> di
             "theirs": len(theirs_digests),
             "missing_in_delivery": len(missing),
             "extra_in_delivery": len(extra),
-            "digests_match": not missing and not extra and len(mine_digests) == len(theirs_digests),
+            "expected_missing": expected_missing,
+            "digests_match": (
+                not extra
+                and len(missing) == expected_missing
+                and len(theirs_digests) + expected_missing == len(mine_digests)
+            ),
         },
         "tokens": {
             "manifest": manifest_tokens,
@@ -310,7 +317,8 @@ def _print(report: dict[str, Any]) -> None:
     print(
         f"交付集 vs 独立保留集（按内容摘要）: {status}"
         f"（我 {kept['mine']} 条 / 交付 {kept['theirs']} 条；"
-        f"交付缺少 {kept['missing_in_delivery']} 条，多出 {kept['extra_in_delivery']} 条）"
+        f"交付缺少 {kept['missing_in_delivery']} 条（提前停止应缺 {kept['expected_missing']} 条），"
+        f"多出 {kept['extra_in_delivery']} 条）"
     )
     tok = report["tokens"]
     print(
