@@ -144,6 +144,30 @@ passed  = session_removed + prefix_removed + kept_records
 kept    = delivered_records + not_delivered
 ```
 
+### 逐文件账本契约（`ledger.json`，验收侧必须能直接对账）
+
+每个文件一条，必带以下派生字段（`finalize_ledger` 统一生成，plan / emit / manifest 三处都会写）：
+
+| 字段 | 含义 |
+| --- | --- |
+| `scanned` | 原始行数 |
+| `parse_error` / `no_session_id` / `no_rs_id` / `no_encrypted_content` / `too_short` | 各过滤原因的移除量（一条都没删也必须写 0） |
+| `passed` | 过滤后通过数 |
+| `session_removed` / `prefix_removed` | 两步去重的移除量 |
+| `kept_records` | 去重后应保留条数 = `passed − session_removed − prefix_removed` |
+| `delivered_records` | 实际交付的源记录条数（切窗记录算 1 条） |
+| `delivered_windows` | **输出的行数**（切窗记录按窗口片数计），不是源记录条数：`delivered_windows ≥ delivered_records` |
+| `delivered_tokens` | 该文件已交付的 token（按锁定口径复算） |
+| `not_delivered` | 停止点之后没交付的条数 = `kept_records − delivered_records` |
+| `status` | `delivered`（全部交付）/ `zero_kept`（去重后 0 条）/ `not_reached`（已索引、被文件边界停挡在后面） |
+
+**已索引未交付**：文件边界停之后，后面的文件仍然在 `ledger.json` 里（`status=not_reached`、
+`delivered_records=0`、`not_delivered=kept_records`），账户恒等式照旧闭合。这是刻意的——
+验收侧要能证明"这些文件被索引过、但一条都没交付"，而不是从账本里消失。
+
+**禁止写 `stop_cut`**：验收侧把 `stop_cut` 当作 `not_delivered` 的别名，两边同时写会双重计数。
+`finalize_ledger` 会主动删除该键。
+
 超过 128k token 的单条会被切成多行。**窗口写回 `request.messages`**，其余字段（`session_id`、`request_id`、`response`、`request.model`、`request.tools` …）原样保留，下游按真实 schema 读取，路径不变：
 
 ```json
@@ -224,3 +248,24 @@ python pipeline/corpus_pipeline.py --execute --target-tokens 1000000000 \
 - 同一批源文件，串行与并发的 `index.jsonl` **行序可能不同**（分段会交错多个文件的块），
   但记录集合、`order` 值、以及 `plan`/`emit` 的产物**逐字节相同**——`tests/test_corpus_pipeline.py::TestConcurrencyEquivalence` 锁死这一点。
 - `read_range` 的单条语义、整组窗口原子提交、停点位置、去重算法**未改动**。
+
+## 八、产物命名与 stop 契约（与验收侧同一份口径）
+
+- **`shards[].source_key` 必填**：每个分片显式写出它来自哪个源对象 key。验收侧据此判断
+  "stop_file 之后有没有更后面的文件"、以及逐源文件核对，缺失会退化成只能按总量核对。
+- **`stop_file` 与 `source_key` 同一命名空间**：都是源对象 key（如
+  `Gpt-2026-10-18/gpt-6-astra-0009-20261001.jsonl`），比较用**字符串序**，
+  不是本地文件名、不是序号。
+- **`.part-NNNN` 从 0001 起、首片也带后缀**：一个源文件只产出一份时命名 `<主干>.jsonl`；
+  一旦切分，**所有**分片都带 `.part-000N`，包括第一片（写入前会把 `<主干>.jsonl`
+  改名为 `<主干>.part-0001.jsonl`，先落 `state.json` 再写下一片）。因此
+  `<主干>.jsonl` 与 `<主干>.part-0001.jsonl` 永远不会并存。
+- **`delivered_windows`** 是输出行数（切窗的每个窗口算一行），**不是**源记录条数；
+  对账用 `delivered_records`，行数核对用 `delivered_windows`。
+- **`--shard-glob` 用法**：验收侧 `verify` / `recount` 与联调工具 `crosscheck`
+  都支持显式 glob。`crosscheck` 的默认值是 `deliver-*.jsonl`（保持旧目录行为，不放宽——
+  同目录还住着 `index.jsonl` / `keep.jsonl`）；按源文件命名时必须显式传：
+
+  ```bash
+  python -m accept.crosscheck --raw-dir <RAW> --delivery <OUT> --shard-glob 'gpt-*.jsonl'
+  ```

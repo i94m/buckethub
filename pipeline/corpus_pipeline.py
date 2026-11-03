@@ -230,7 +230,8 @@ class Ledger:
     def totals(self):
         keys = ["scanned", "parse_error", "no_session_id", "no_rs_id", "no_encrypted_content",
                 "too_short", "passed", "session_removed", "prefix_removed", "exact_dup",
-                "delivered_records", "delivered_windows", "delivered_tokens"]
+                "delivered_records", "delivered_windows", "delivered_tokens",
+                "kept_records", "not_delivered"]
         out = {k: sum(f.get(k, 0) for f in self.files.values()) for k in keys}
         out.update(self.meta)
         out["filter_closure_ok"] = (
@@ -239,6 +240,38 @@ class Ledger:
             + out["no_encrypted_content"] + out["too_short"]
         )
         return out
+
+
+def finalize_ledger(ledger) -> None:
+    """逐文件补齐验收侧对账所需的派生字段（不做任何口径放宽）。
+
+    accept 侧的对账恒等式是 ``原始 = 各移除步骤 + 交付 + 停止后未交付``。开发侧原来只写了
+    交付条数，停止点之后的文件（``delivered=0``）和零保留文件都会让该等式两边对不上，
+    被 judge 成「交付计数没有回写账本」。这里补三个派生字段：
+
+    * ``kept_records``  —— 去重后应保留条数 = passed − session_removed − prefix_removed
+    * ``not_delivered`` —— 停止点之后没交付的条数 = kept − delivered
+    * ``status``        —— ``delivered`` / ``zero_kept`` / ``not_reached``（防御性另有 ``partial``）
+
+    注意：**绝不能写 ``stop_cut``**——accept 把它当作 ``not_delivered`` 的别名，
+    两边同时写会双重计数（M4 已实证）。
+    """
+    for row in ledger.files.values():
+        row.pop("stop_cut", None)
+        kept = max(0, int(row.get("passed", 0))
+                   - int(row.get("session_removed", 0))
+                   - int(row.get("prefix_removed", 0)))
+        delivered = int(row.get("delivered_records", 0))
+        row["kept_records"] = kept
+        row["not_delivered"] = max(0, kept - delivered)
+        if kept == 0:
+            row["status"] = "zero_kept"
+        elif delivered == 0:
+            row["status"] = "not_reached"
+        elif delivered >= kept:
+            row["status"] = "delivered"
+        else:
+            row["status"] = "partial"
 
 
 # --------------------------------------------------------------------- 源数据
@@ -706,6 +739,7 @@ def phase_plan(args, state, ledger, out_dir: Path):
     for it in result["prefix_removed"]:
         ledger.file(it["key"])["prefix_removed"] += 1
     ledger.meta["exact_dup"] = result["exact_dup"]
+    finalize_ledger(ledger)
     state.data["ledger"] = ledger.files
     state.save()
     write_ledger_json(out_dir, ledger)
@@ -999,6 +1033,7 @@ def phase_emit(args, state, ledger, out_dir: Path, budget: SegmentBudget):
             seen_records.add(e["id"])
             row["delivered_records"] += 1
 
+    finalize_ledger(ledger)
     emit_state.update({"stop_reason": stop_reason, "tokens": written_tokens,
                        "total_samples": total_samples,
                        "stop_after_record": stop_after_record,
@@ -1020,6 +1055,7 @@ def write_manifest(args, state, ledger, out_dir: Path, delivered_tokens, stop_re
     journal = _load_journal(out_dir / "emit.journal")
     journal_ids = {e["id"] for e in journal}
     delivered_records = len(journal_ids)
+    finalize_ledger(ledger)
     totals = ledger.totals()
 
     files_state = emit.get("files") or {}
