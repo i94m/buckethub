@@ -119,20 +119,35 @@ def filter_reason(record, min_messages=MIN_MESSAGES):
 
 
 def session_dedup(items):
-    """同 uuid 只留 messages 最长；并列取 timestamp 较新、再取输入顺序靠前。"""
-    best = {}
-    for it in items:
-        cur = best.get(it["uuid"])
-        if cur is None:
-            best[it["uuid"]] = it
+    """同 uuid 的去重是全序、确定性的：
+
+    **messages 最长 → timestamp 较新 → 原下标较小**
+
+    第三条不能用「输入列表里谁先出现」糊弄——分段/并发下 index 的追加顺序会变，
+    同一份数据两次跑可能选出不同记录。这里的「原下标」取稳定的 ``order`` 字段
+    （= 文件排名 × 2^40 + 文件内字节偏移），与分段/并发无关；老数据没有该字段时
+    退回输入下标。
+    """
+    groups = {}
+    for idx, it in enumerate(items):
+        groups.setdefault(it["uuid"], []).append(idx)
+
+    winners = set()
+    removed_idx = []
+    for members in groups.values():
+        if len(members) == 1:
+            winners.add(members[0])
             continue
-        a = (it["n_msgs"], it.get("timestamp") or "")
-        b = (cur["n_msgs"], cur.get("timestamp") or "")
-        if a > b:
-            best[it["uuid"]] = it
-    kept_ids = {id(v) for v in best.values()}
-    kept = [it for it in items if id(it) in kept_ids]
-    removed = [it for it in items if id(it) not in kept_ids]
+        # 三次稳定排序拼出 (最长, timestamp 新→旧, 稳定 order 小→大)
+        ranked = sorted(members, key=lambda i: items[i].get("order", i))
+        ranked.sort(key=lambda i: items[i].get("timestamp") or "", reverse=True)
+        ranked.sort(key=lambda i: -int(items[i]["n_msgs"]))
+        winners.add(ranked[0])
+        removed_idx.extend(i for i in members if i != ranked[0])
+
+    removed_idx.sort()
+    kept = [it for i, it in enumerate(items) if i in winners]
+    removed = [items[i] for i in removed_idx]
     return kept, removed
 
 

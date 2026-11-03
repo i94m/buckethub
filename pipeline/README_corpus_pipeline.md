@@ -269,3 +269,17 @@ python pipeline/corpus_pipeline.py --execute --target-tokens 1000000000 \
   ```bash
   python -m accept.crosscheck --raw-dir <RAW> --delivery <OUT> --shard-glob 'gpt-*.jsonl'
   ```
+
+## 九、session 去重的并列规则（全序、跨段跨并发确定）
+
+同 uuid 的多条快照按**全序**选一条，顺序写死，不接受"看谁先读到"：
+
+```
+messages 条数最多  →  timestamp 较新（ISO 串字典序）  →  稳定 order 较小
+```
+
+`order` = 文件排名 × 2^40 + 文件内字节偏移，由索引阶段写入，与分段/并发无关；
+所以同一份数据跑两次（哪怕分段边界不同、`--index-connections` 不同）选出的记录完全一致。
+
+以前第三条用的是"输入顺序靠前"，而输入顺序会随分段/并发的追加次序变化——同一 uuid 的两条
+若分属不同文件的不同块，就可能两次跑选出不同的记录，进而让 crosscheck 永久误报。

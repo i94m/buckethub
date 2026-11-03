@@ -792,3 +792,44 @@ class TestS3RangeResume(_PipelineCase):
         rows = [json.loads(ln) for ln in (self.out / "index.jsonl").read_text().splitlines()]
         self.assertEqual(len(rows), 6)
         self.assertEqual(len({r["id"] for r in rows}), 6)
+
+
+class TestSessionTieBreak(_PipelineCase):
+    """并列规则必须全序：messages 最长 → timestamp 较新 → 原下标较小。
+
+    这条是契约缺口（合成数据造不出 tie，只有真实数据会撞）：
+    开发侧按 timestamp 选，验收侧曾按序列指纹选，1B 规模下 crosscheck 会持续误报。
+    """
+
+    def test_same_count_prefers_newer_timestamp(self):
+        old = index_item(make_record(uuid="tie", sid_suffix="a", n=100, seed="x",
+                                     ts="2026-01-01T00:00:00Z"), off=1)
+        new = index_item(make_record(uuid="tie", sid_suffix="b", n=100, seed="y",
+                                     ts="2026-02-01T00:00:00Z"), off=2, order=1)
+        kept, removed = cp.session_dedup([old, new])
+        self.assertEqual(ids(kept), ["k.jsonl#2"])
+        self.assertEqual(ids(removed), ["k.jsonl#1"])
+
+    def test_full_tie_keeps_lower_index(self):
+        a = index_item(make_record(uuid="tie", sid_suffix="a", n=100, seed="x",
+                                   ts="2026-01-01T00:00:00Z"), off=1)
+        b = index_item(make_record(uuid="tie", sid_suffix="b", n=100, seed="y",
+                                   ts="2026-01-01T00:00:00Z"), off=2, order=1)
+        kept, _ = cp.session_dedup([a, b])
+        self.assertEqual(ids(kept), ["k.jsonl#1"], "同长同时间的完全并列必须取原下标小的")
+
+    def test_longer_wins_over_newer(self):
+        longer = index_item(make_record(uuid="tie", sid_suffix="a", n=120, seed="x",
+                                        ts="2026-01-01T00:00:00Z"), off=1)
+        newer = index_item(make_record(uuid="tie", sid_suffix="b", n=100, seed="y",
+                                       ts="2026-12-01T00:00:00Z"), off=2, order=1)
+        kept, _ = cp.session_dedup([longer, newer])
+        self.assertEqual(ids(kept), ["k.jsonl#1"])
+
+    def test_order_independent(self):
+        a = index_item(make_record(uuid="tie", sid_suffix="a", n=100, seed="x",
+                                   ts="2026-01-01T00:00:00Z"), off=1)
+        b = index_item(make_record(uuid="tie", sid_suffix="b", n=100, seed="y",
+                                   ts="2026-02-01T00:00:00Z"), off=2, order=1)
+        self.assertEqual(ids(cp.session_dedup([a, b])[0]), ids(cp.session_dedup([b, a])[0]),
+                         "去重结果不能依赖输入顺序（分段/并发下顺序会变）")
