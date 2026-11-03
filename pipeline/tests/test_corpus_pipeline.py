@@ -833,3 +833,82 @@ class TestSessionTieBreak(_PipelineCase):
                                    ts="2026-02-01T00:00:00Z"), off=2, order=1)
         self.assertEqual(ids(cp.session_dedup([a, b])[0]), ids(cp.session_dedup([b, a])[0]),
                          "去重结果不能依赖输入顺序（分段/并发下顺序会变）")
+
+
+# ---------------------------------------------------------------- A1：整条丢弃含图记录
+# 2026-11-03 用户拍板 A1：交付纯文本，含图记录整条不要。
+# 红线在 index 扫描期，计数器落 ledger.json 的 has_image 一栏。
+
+
+def with_image(record, *, where="first", part_type="input_image"):
+    """把图片 part 塞进指定 message 的 content[]。"""
+    msgs = record["request"]["messages"]
+    index = 0 if where == "first" else (len(msgs) // 2 if where == "middle" else len(msgs) - 1)
+    if part_type == "image_url":
+        msgs[index]["content"].append({"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}})
+    elif part_type == "bare_image_url":
+        msgs[index]["content"].append({"image_url": "data:image/png;base64,AAAA"})
+    else:
+        msgs[index]["content"].append({"type": "input_image", "image_url": "data:image/png;base64,AAAA"})
+    return record
+
+
+class TestA1ImageFilter(unittest.TestCase):
+    def test_clean_record_passes(self):
+        self.assertIsNone(cp.filter_reason(make_record(n=100)))
+
+    def test_input_image_is_rejected(self):
+        self.assertEqual(cp.filter_reason(with_image(make_record())), "has_image")
+
+    def test_image_url_type_is_rejected(self):
+        self.assertEqual(cp.filter_reason(with_image(make_record(), part_type="image_url")), "has_image")
+
+    def test_bare_image_url_field_is_rejected(self):
+        self.assertEqual(cp.filter_reason(with_image(make_record(), part_type="bare_image_url")), "has_image")
+
+    def test_image_in_any_message_drops_whole_record(self):
+        # 图藏在中间/最后一条 message 里也要整条剔除
+        self.assertEqual(cp.filter_reason(with_image(make_record(), where="middle")), "has_image")
+        self.assertEqual(cp.filter_reason(with_image(make_record(), where="last")), "has_image")
+
+    def test_image_only_record_hits_earlier_filter_first(self):
+        # 顺序契约：has_image 是最后一道，只度量"本可交付"的记录。
+        # 只含图、没有密文 part 的记录仍记在 no_encrypted_content 上。
+        rec = make_record(enc=False)
+        rec["request"]["messages"] = [{"role": "user", "content": [
+            {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}]} for _ in range(100)]
+        self.assertEqual(cp.filter_reason(rec), "no_encrypted_content")
+
+    def test_ledger_closure_includes_has_image(self):
+        led = cp.Ledger()
+        for reason in (None, "too_short", "has_image", "has_image", "no_rs_id"):
+            led.tally_filter("f.jsonl", reason)
+        totals = led.totals()
+        self.assertEqual(totals["has_image"], 2)
+        self.assertEqual(totals["scanned"], 5)
+        self.assertEqual(totals["passed"], 1)
+        self.assertTrue(totals["filter_closure_ok"])
+
+
+class TestA1EndToEnd(_PipelineCase):
+    def test_image_records_are_not_delivered_and_counted(self):
+        clean_a = make_record(uuid="a1-clean-a", n=100, seed="ca")
+        clean_b = make_record(uuid="a1-clean-b", n=100, seed="cb")
+        imaged = with_image(make_record(uuid="a1-img", n=100, seed="ci"))
+        write_named(self.src, "gpt-a1-0001.jsonl", [clean_a, imaged])
+        write_named(self.src, "gpt-a1-0002.jsonl", [clean_b])
+
+        self.run_pipeline("--target-tokens", "1000000000")
+        man = self.manifest()
+        self.assertEqual(man["ledger"]["has_image"], 1)
+        self.assertTrue(man["ledger"]["filter_closure_ok"])
+        self.assertEqual(man["delivered_records"], 2)
+        self.assertEqual(man["kept_records"], 2)
+        for shard in man["shards"]:
+            for line in (self.out / shard["file"]).read_text().splitlines():
+                rec = json.loads(line)
+                self.assertFalse(cp.has_image(cp.messages_of(rec)), "交付里不允许出现含图记录")
+        led = self.ledger()
+        row = led["files"]["gpt-a1-0001.jsonl"]
+        self.assertEqual(row["has_image"], 1)
+        self.assertEqual(row["kept_records"], 1)

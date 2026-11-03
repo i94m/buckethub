@@ -91,6 +91,27 @@ def has_rs_id(record) -> bool:
     return any(isinstance(it, dict) and str(it.get("id", "")).startswith("rs_") for it in out)
 
 
+IMAGE_PART_TYPES = ("input_image", "image_url", "input_image_url")
+
+
+def has_image(messages) -> bool:
+    """A1 口径：任一 message 的 content[] 含图片 part 即整条剔除。
+
+    判据与验收侧同一份：``type`` 命中 ``input_image`` / ``image_url``，
+    或者 part 里带 ``image_url`` 字段（有些上游把图片塞进别的 type 里）。
+    """
+    for m in messages:
+        content = m.get("content") if isinstance(m, dict) else None
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") in IMAGE_PART_TYPES or "image_url" in part:
+                return True
+    return False
+
+
 def has_encrypted_content(messages) -> bool:
     for m in messages:
         content = m.get("content") if isinstance(m, dict) else None
@@ -115,6 +136,10 @@ def filter_reason(record, min_messages=MIN_MESSAGES):
         return "no_encrypted_content"
     if len(messages) < min_messages:
         return "too_short"
+    # A1：整条丢弃含图记录。**放在最后一道**，这样 has_image 的计数恰好是
+    # "本来能交付、只因为含图被丢"的条数；含图且缺密文/太短的记录仍记在更前面那道。
+    if has_image(messages):
+        return "has_image"
     return None
 
 
@@ -244,15 +269,15 @@ class Ledger:
 
     def totals(self):
         keys = ["scanned", "parse_error", "no_session_id", "no_rs_id", "no_encrypted_content",
-                "too_short", "passed", "session_removed", "prefix_removed", "exact_dup",
-                "delivered_records", "delivered_windows", "delivered_tokens",
+                "too_short", "has_image", "passed", "session_removed", "prefix_removed",
+                "exact_dup", "delivered_records", "delivered_windows", "delivered_tokens",
                 "kept_records", "not_delivered"]
         out = {k: sum(f.get(k, 0) for f in self.files.values()) for k in keys}
         out.update(self.meta)
         out["filter_closure_ok"] = (
             out["scanned"] - out["passed"]
             == out["parse_error"] + out["no_session_id"] + out["no_rs_id"]
-            + out["no_encrypted_content"] + out["too_short"]
+            + out["no_encrypted_content"] + out["too_short"] + out["has_image"]
         )
         return out
 

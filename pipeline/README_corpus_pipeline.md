@@ -139,7 +139,7 @@ python pipeline/corpus_pipeline.py --execute --reset --out-dir ./corpus_out
 对账关系（`ledger.json` 按文件可逐一对上）：
 
 ```
-scanned = parse_error + no_session_id + no_rs_id + no_encrypted_content + too_short + passed
+scanned = parse_error + no_session_id + no_rs_id + no_encrypted_content + too_short + has_image + passed
 passed  = session_removed + prefix_removed + kept_records
 kept    = delivered_records + not_delivered
 ```
@@ -151,7 +151,7 @@ kept    = delivered_records + not_delivered
 | 字段 | 含义 |
 | --- | --- |
 | `scanned` | 原始行数 |
-| `parse_error` / `no_session_id` / `no_rs_id` / `no_encrypted_content` / `too_short` | 各过滤原因的移除量（一条都没删也必须写 0） |
+| `parse_error` / `no_session_id` / `no_rs_id` / `no_encrypted_content` / `too_short` / `has_image` | 各过滤原因的移除量（一条都没删也必须写 0） |
 | `passed` | 过滤后通过数 |
 | `session_removed` / `prefix_removed` | 两步去重的移除量 |
 | `kept_records` | 去重后应保留条数 = `passed − session_removed − prefix_removed` |
@@ -283,3 +283,20 @@ messages 条数最多  →  timestamp 较新（ISO 串字典序）  →  稳定 
 
 以前第三条用的是"输入顺序靠前"，而输入顺序会随分段/并发的追加次序变化——同一 uuid 的两条
 若分属不同文件的不同块，就可能两次跑选出不同的记录，进而让 crosscheck 永久误报。
+
+## 十、A1 口径：含图记录整条剔除（2026-11-03 用户拍板）
+
+`request.messages[].content[]` 里只要有任一 part 是图片（`type` ∈
+`input_image` / `image_url` / `input_image_url`，或者 part 带 `image_url` 字段），
+**整条记录不交付**，其余字段与记录不动（不是剥 part，是整条丢）。
+
+- **判定顺序：放在最后一道过滤（`too_short` 之后）**。所以 `has_image` 的计数恰好是
+  「本来能交付、只因为含图被丢」的条数；一条既含图又缺密文的记录仍记在
+  `no_encrypted_content` 上，不会重复计数。
+- **账本**：`ledger.json` 每个文件新增 `has_image` 一栏，`totals` 同步；
+  过滤段恒等式变为
+  `scanned = parse_error + no_session_id + no_rs_id + no_encrypted_content + too_short + has_image + passed`。
+- **验收侧适配**：`has_image` 归类为 `filter_has_image`（可选步骤，老交付没有该项也不报错），
+  计入过滤段闭合；`crosscheck` 的独立重算同样按这条剔除，逐文件 `filter_has_image`
+  两侧必须相等。
+- **不含图的部分完全不变**：过滤、去重、切窗、账本、命名、停点一行未动。
