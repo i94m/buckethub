@@ -43,6 +43,10 @@ class ShardConfig:
         "_chunk",
     )
     min_messages_applies_to_windows: bool = False
+    #: 开发侧实际输出把窗口内容写在顶层 ``messages``，而 ``request.messages`` 仍是
+    #: 未切窗的完整对话。默认判为错误（下游按真实 schema 读会拿到超长记录），
+    #: 一旦双方确认改口径，用这个开关放行。
+    allow_top_level_window_messages: bool = False
     max_records_for_prefix_check: int = 200_000
 
     @property
@@ -64,7 +68,7 @@ class ShardReport:
     fingerprints: list[str] = field(default_factory=list)
     rs_ids: list[str] = field(default_factory=list)
     window_rs_ids: list[str] = field(default_factory=list)
-    windowing: list[tuple[str, int, int]] = field(default_factory=list)
+    windowing: list[tuple[str, int, int, int, Any]] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -137,7 +141,16 @@ def rs_ids(record: Any) -> list[str]:
 
 
 def window_info(record: Any, keys: Sequence[str] = ShardConfig().window_marker_keys) -> dict[str, Any] | None:
-    """识别切窗记录：顶层或 ``meta``/``_meta`` 下的窗口标记。"""
+    """识别并归一化切窗标记。
+
+    两种写法都认：
+
+    * 验收侧参考格式 ``{"window": {"index", "count", "source_fingerprint"}}``；
+    * 开发侧实际格式 ``{"_window": {"index", "of", "source": {"key", "off"},
+      "messages_total", "oversize_message"}}``。
+
+    归一后统一给出 ``index`` / ``count`` / ``fingerprint`` / ``messages_total``。
+    """
     if not isinstance(record, dict):
         return None
     for container in (record, record.get("meta"), record.get("_meta")):
@@ -147,10 +160,34 @@ def window_info(record: Any, keys: Sequence[str] = ShardConfig().window_marker_k
             value = container.get(key)
             if value is None:
                 continue
-            if isinstance(value, dict):
-                return value
-            return {"value": value}
+            if not isinstance(value, dict):
+                return {"value": value}
+            count = value.get("count", value.get("of"))
+            fingerprint = value.get("source_fingerprint") or value.get("fingerprint")
+            if not fingerprint:
+                source = value.get("source")
+                if isinstance(source, dict):
+                    fingerprint = f"{source.get('key')}#{source.get('off')}"
+            return {
+                **value,
+                "index": value.get("index"),
+                "count": count,
+                "fingerprint": fingerprint or "",
+                "messages_total": value.get("messages_total"),
+            }
     return None
+
+
+def window_messages(record: Any, window: dict[str, Any] | None) -> tuple[list, str]:
+    """返回 (窗口内容, 内容位置)。
+
+    位置 ``top`` = 顶层 ``messages``（开发侧现状）；``request`` = ``request.messages``。
+    """
+    if window is not None:
+        top = record.get("messages")
+        if isinstance(top, list):
+            return top, "top"
+    return get_messages(record), "request"
 
 
 # --------------------------------------------------------------------------
@@ -203,12 +240,14 @@ def check_shard(
                 continue
 
             report.records += 1
-            messages = get_messages(record)
-            if not isinstance(messages, list):
+            request_messages = get_messages(record)
+            if not isinstance(request_messages, list):
                 report.problems.append(Problem("error", where, "缺少 request.messages 数组"))
-                messages = []
+                request_messages = []
 
             window = window_info(record, cfg.window_marker_keys)
+            messages, content_location = window_messages(record, window)
+
             if window is not None:
                 report.windowed_records += 1
                 index = window.get("index")
@@ -218,12 +257,31 @@ def check_shard(
                         report.problems.append(
                             Problem("error", where, f"窗口下标越界: index={index}, count={count}")
                         )
-                    fingerprint = str(window.get("source_fingerprint") or window.get("fingerprint") or "")
-                    report.windowing.append((fingerprint, index, count))
+                    report.windowing.append(
+                        (
+                            str(window.get("fingerprint") or ""),
+                            index,
+                            count,
+                            len(messages),
+                            window.get("messages_total"),
+                        )
+                    )
                 elif isinstance(window.get("value"), int):
                     # 只写了 window_index 这类裸标记：至少保证非负
                     if window["value"] < 0:
                         report.problems.append(Problem("error", where, "窗口下标为负"))
+
+                if content_location == "top" and len(request_messages) > len(messages):
+                    level = "warn" if cfg.allow_top_level_window_messages else "error"
+                    report.problems.append(
+                        Problem(
+                            level,
+                            where,
+                            f"切窗把窗口内容写在顶层 messages（{len(messages)} 条），"
+                            f"而 request.messages 仍是未切窗的 {len(request_messages)} 条——"
+                            "下游按真实 schema 读 request.messages 会拿到超长记录，切窗等于没做",
+                        )
+                    )
 
             if window is None or cfg.min_messages_applies_to_windows:
                 if len(messages) < cfg.min_messages:
@@ -244,7 +302,9 @@ def check_shard(
             else:
                 report.rs_ids.extend(rs_ids(record))
 
-            if not has_encrypted_part(record):
+            # 密文 part 是"源记录级"属性：切窗后单片可能一条密文都没有，
+            # 逐片要求会把正确交付判死；非切窗记录仍然逐条要求。
+            if window is None and not has_encrypted_part(record):
                 report.problems.append(
                     Problem(
                         "error",
@@ -366,8 +426,8 @@ def check_delivery(
     seen_fingerprints: dict[str, str] = {}
     seen_rs: dict[str, str] = {}
     seen_window_rs: dict[str, str] = {}
-    window_groups: dict[str, list[tuple[str, int, int]]] = {}
-    records_for_prefix: list[dict] = []
+    window_groups: dict[str, list[tuple[str, int, int, int, Any]]] = {}
+    sequences_for_prefix: list[list] = []
 
     for path in shard_paths:
         shard = check_shard(path, cfg, counter=counter)
@@ -394,8 +454,10 @@ def check_delivery(
         # 所以只对"非切窗记录之间"查重，另外单独校验窗口覆盖完整性。
         for rs_id in shard.window_rs_ids:
             seen_window_rs.setdefault(rs_id, path.name)
-        for fingerprint, index, count in shard.windowing:
-            window_groups.setdefault(fingerprint, []).append((path.name, index, count))
+        for fingerprint, index, count, n_messages, messages_total in shard.windowing:
+            window_groups.setdefault(fingerprint, []).append(
+                (path.name, index, count, n_messages, messages_total)
+            )
 
     for rs_id, where in seen_window_rs.items():
         if rs_id in seen_rs:
@@ -410,8 +472,8 @@ def check_delivery(
     for fingerprint, entries in window_groups.items():
         if not fingerprint:
             continue
-        counts = {count for _, _, count in entries}
-        indices = sorted(index for _, index, _ in entries)
+        counts = {count for _, _, count, _, _ in entries}
+        indices = sorted(index for _, index, _, _, _ in entries)
         if len(counts) != 1:
             report.problems.append(
                 Problem("error", "delivery", f"同一源记录的窗口片数不一致: {sorted(counts)}")
@@ -426,10 +488,28 @@ def check_delivery(
                     f"切窗覆盖不完整或重叠（指纹 {fingerprint[:12]}）: 实际 {indices}，应为 {expected}",
                 )
             )
+            continue
+        totals = {total for _, _, _, _, total in entries if isinstance(total, int)}
+        n_sum = sum(n for _, _, _, n, _ in entries)
+        if len(totals) > 1:
+            report.problems.append(
+                Problem("error", "delivery", f"同一源记录的 messages_total 不一致: {sorted(totals)}")
+            )
+        elif totals:
+            messages_total = totals.pop()
+            if n_sum != messages_total:
+                report.problems.append(
+                    Problem(
+                        "error",
+                        "delivery",
+                        f"切窗片段的 messages 合计 {n_sum} ≠ 源记录 {messages_total} 条"
+                        "（有窗口内容缺失或重叠）",
+                    )
+                )
 
     if check_prefix_invariant:
         for path in shard_paths:
-            if len(records_for_prefix) >= cfg.max_records_for_prefix_check:
+            if len(sequences_for_prefix) >= cfg.max_records_for_prefix_check:
                 break
             with open(path, "rb") as handle:
                 for raw in handle:
@@ -439,11 +519,14 @@ def check_delivery(
                         record = json.loads(raw)
                     except Exception:
                         continue
-                    if isinstance(record, dict):
-                        records_for_prefix.append(record)
+                    if not isinstance(record, dict):
+                        continue
+                    window = window_info(record, cfg.window_marker_keys)
+                    content, _location = window_messages(record, window)
+                    sequences_for_prefix.append(content if isinstance(content, list) else [])
 
-    if check_prefix_invariant and records_for_prefix:
-        violations = dedup.find_prefix_violations(records_for_prefix)
+    if check_prefix_invariant and sequences_for_prefix:
+        violations = dedup.find_sequence_violations(sequences_for_prefix)
         for violation in violations[:20]:
             report.problems.append(
                 Problem(

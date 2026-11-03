@@ -36,7 +36,11 @@
 
 ---
 
-## 二、交付契约（开发侧按这个写，验收侧按这个验）
+## 二、交付契约
+
+**以开发侧 `pipeline/corpus_pipeline.py` 的实际输出为准**（联调后对齐，见第八节）。
+下面先写"验收侧认什么"，再写具体字段；字段名两侧不一致的地方已经做了归一，
+不需要开发侧迁就本文件里的别名。
 
 ### 2.1 分片
 
@@ -48,11 +52,19 @@
 
 ### 2.2 切窗标记
 
-切窗片段需要在记录里带一个窗口标记，验收侧认这几个键名（顶层或 `meta`/`_meta` 下）：
+切窗片段需要在记录里带一个窗口标记，验收侧认这几个键名（顶层或 `meta`/`_meta` 下），
+两种写法等价：
 
 ```json
-{"window": {"index": 0, "count": 3, "source_fingerprint": "<该源记录的稳定指纹>"}}
+{"window": {"index": 0, "count": 3, "source_fingerprint": "<源记录指纹>"}}
+{"_window": {"index": 0, "of": 3, "source": {"key": "x.jsonl", "off": 123},
+             "messages_total": 1234, "oversize_message": 0}}
 ```
+
+窗口内容**必须放在 `request.messages`**（与未切窗记录同一条读取路径）。
+开发侧目前把窗口内容写在顶层 `messages`、而 `request.messages` 仍是完整对话，
+验收侧默认判为错误——因为下游按真实 schema 读到的还是超长记录，切窗等于没做。
+双方确认改口径前，可用 `--allow-top-level-window-messages` 放行（降级为 warn）。
 
 - `index` / `count` 用于校验覆盖：同一 `source_fingerprint` 的片段必须正好覆盖
   `0..count-1`，不能缺、不能重。
@@ -132,6 +144,7 @@
 | token 复算 | `accept/tokens.py` 两套独立序列化 + tiktoken，逐片比对 manifest | 是（误差必须 0） |
 | 对账 | `accept/ledger.py` 逐文件恒等式 + 总量/分片交叉核对 | 是 |
 | 分片完整性 | `accept/shard.py` 逐行 `json.loads`、末尾完整、体积、单条 token、rs_id、密文、切窗覆盖 | 是 |
+| 两侧交叉验证 | `accept/crosscheck.py` 用独立实现从原始 jsonl 重算，对比开发侧账本与交付内容 | 是 |
 
 ---
 
@@ -156,7 +169,13 @@ python3 -m accept.cli fixture --out ./accept-fixture --execute
 
 # 5) 自检：合成 → 参考交付 → 验收 → 8 类破坏必须报错
 python3 -m accept.cli selftest --execute
+
+# 6) 联调：开发侧产出目录 vs 验收侧独立重算
+python3 -m accept.crosscheck --raw-dir ./itest/raw --delivery ./itest/out
 ```
+
+窗口内容写在顶层 `messages` 的交付（开发侧当前形态）默认会有 error；
+确认口径后用 `--allow-top-level-window-messages` 放行。
 
 退出码：`0` 通过 / `1` 验收不通过 / `2` 参数或配置错误 / `3` 分词器不可用。
 
@@ -198,8 +217,11 @@ python3 -m unittest discover -s accept/tests -t .
 | `tests/test_shard.py` | 末尾无换行、坏行、体积超限、单条超 token、切窗豁免与覆盖、rs_id/密文缺失、重复记录/重复 rs_id、编号跳号、交付集前缀违规 |
 | `tests/test_e2e.py` | 合成 → 参考交付 → 全量验收通过、逐文件对账闭合、可复现、体积切分、1B 即停记账、**dry-run 不读不写** |
 
-`tiktoken` 缺失时，依赖真分词的 8 个用例自动 skip，其余全跑——这是刻意的：
-记账/切片/去重这些逻辑不该被"没装包"挡住。
+另有 `tests/test_dev_format.py`（11 例）专门锁住开发侧实际格式：`ledger.json` sidecar、
+`_window` 的 `of`/`source`、窗口内容位置、窗口覆盖完整性、停止后未交付的归属。
+
+`tiktoken` 缺失时，依赖真分词的用例自动 skip，其余全跑——这是刻意的：
+记账/切片/去重这些逻辑不该被"没装包"挡住。装好后跑全绿（99 例，0 skip）。
 
 ---
 
@@ -216,7 +238,39 @@ python3 -m unittest discover -s accept/tests -t .
 
 ---
 
-## 七、已知边界
+## 七、和开发侧实际输出的对齐（联调结论）
+
+用 `pipeline/corpus_pipeline.py --local-dir <合成目录> --execute` 实跑后，两边差异如下，
+**验收侧已全部适配，开发侧不需要改格式**：
+
+| 项 | 开发侧实际 | 验收侧处理 |
+| --- | --- | --- |
+| manifest 顶层 | `STOP_REASON` / `delivered_tokens` / `delivered_samples` / `kept_records` / `delivered_records` / `not_delivered` / `shards` / `config` / `ledger` | 别名归一 |
+| 逐文件明细 | 不在 manifest 里，在同目录 `ledger.json` 的 `files{}`，字段扁平 | 自动读 sidecar，扁平字段按关键词归类 |
+| 过滤步骤 | 多一个 `no_session_id` | 作为可选步骤 `filter_no_session_id` 纳入对账 |
+| 停止原因 | `corpus_exhausted` | 归一为 `source_exhausted` |
+| 分片清单 | `{file, samples, bytes, tokens}` | `samples` 视为行数 |
+| tokenizer | 只写了 `config.tokenizer = o200k_base` | 从 config 取编码器；方法按锁定口径（`encode_ordinary`） |
+| 切窗标记 | `_window{index, of, source{key,off}, messages_total}` | `of`→`count`，`source.key#off` 当指纹 |
+| 窗口内容 | 顶层 `messages` | 默认报错；`--allow-top-level-window-messages` 可放行 |
+| 未交付 | 只有总量 `not_delivered` | 逐文件差额合计与总量一致时降级为 warn |
+| 交付行数 | `delivered_samples`（行）/ `delivered_records`（源记录） | 分片行数按 `delivered_samples` 校验 |
+
+### 逐项交叉验证（`accept/crosscheck.py`）
+
+```bash
+python3 -m accept.crosscheck --raw-dir ./itest/raw --delivery ./itest/out
+```
+
+它不看开发侧代码，直接用本仓库的 `dedup` / `tokens` 从原始 jsonl 重算一遍，然后对比：
+
+- 逐文件：扫描数、各过滤原因、session 移除、前缀移除、保留数（开发侧账本 vs 独立重算）；
+- 交付集：把分片内容按 `_window` 合并后与独立算出的保留集按**内容摘要**比对；
+- token：交付复算 vs manifest 声明，误差必须 0。
+
+对联调数据的实测结论：逐文件计数逐项一致、保留集 12 条缺 0 多 0、token 误差 0。
+
+## 八、已知边界
 
 - **单条消息本身就超 128k token**：无论怎么切窗都满足不了，验收会明确报错；
   这种情况要么换样本，要么显式放宽 `--max-record-tokens` 并写进交付说明。
@@ -225,3 +279,5 @@ python3 -m unittest discover -s accept/tests -t .
 - **分片体积**：只容忍 2% 的写后切分；要求更严可以 `--shard-slack 0`。
 - **manifest 字段名**：别名覆盖常见写法，缺字段时给 warn、错字段给 error；
   实在对不上就用 `--report` 输出明细，按 `where` 定位。
+- **单行大于分片阈值**：`--shard-bytes` 是软上限，一条记录本身超过阈值时仍会写入并超包
+  （默认 500 MB、单条 1~8 MB 时不会发生）。验收侧按硬上限检查，触发即报错。

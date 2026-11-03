@@ -247,8 +247,14 @@ def count_record(record: Any, *, encoding: str = ENCODING_NAME) -> int:
     return count_messages(get_messages(record), encoding=encoding)
 
 
-def variant_counts(record: Any, *, encoding: str = ENCODING_NAME) -> dict[str, int]:
-    """同一份 messages 在 4 种序列化口径下的 token 数，用于口径反推。"""
+def variant_counts(
+    record: Any, *, line: bytes | None = None, encoding: str = ENCODING_NAME
+) -> dict[str, int]:
+    """同一份 messages 在 4 种序列化口径下的 token 数，用于口径反推。
+
+    给了 ``line``（交付行的原始字节）时，额外算一遍"文件里原样字节"口径，
+    可直接看出交付方是用哪种序列化写的记录。
+    """
     messages = get_messages(record)
     result: dict[str, int] = {}
     for name, kwargs in SERIALIZER_VARIANTS.items():
@@ -257,9 +263,11 @@ def variant_counts(record: Any, *, encoding: str = ENCODING_NAME) -> dict[str, i
             serializer=lambda m, _kw=kwargs: compact_json(m, **_kw),
             encoding=encoding,
         )
-    result["raw_bytes_in_file"] = count_messages(
-        raw_message_texts(record), encoding=encoding
-    )
+    if line is not None:
+        try:
+            result["raw_bytes_in_file"] = count_raw_line(line, encoding=encoding)
+        except Exception:
+            result["raw_bytes_in_file"] = -1
     return result
 
 

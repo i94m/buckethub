@@ -153,8 +153,12 @@ class TiktokenCountTest(unittest.TestCase):
             messages=[synth.message("user", "中文内容需要转义")],
             rs_id="rs_var",
         )
-        counts = tokens.variant_counts(record)
+        line = json.dumps(record, ensure_ascii=False, separators=(",", ":")).encode()
+        counts = tokens.variant_counts(record, line=line)
         self.assertEqual(set(counts), set(tokens.SERIALIZER_VARIANTS) | {"raw_bytes_in_file"})
+        self.assertEqual(
+            set(tokens.variant_counts(record)), set(tokens.SERIALIZER_VARIANTS)
+        )
         self.assertNotEqual(
             counts["spec(compact,sort_keys,utf8)"], counts["compact,sort_keys,ascii"]
         )

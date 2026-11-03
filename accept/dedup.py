@@ -246,9 +246,22 @@ def find_prefix_violations(
 ) -> list[PrefixViolation]:
     """对已交付集合做同一套排序+相邻比对，返回全部违规对（0 条才是干净）。"""
     order = list(range(len(records))) if indices is None else list(indices)
+    return find_sequence_violations(
+        [get_messages(records[idx]) for idx in order], fields=fields
+    )
+
+
+def find_sequence_violations(
+    sequences: Sequence[Sequence[Any]],
+    *,
+    fields: Sequence[str] | None = None,
+) -> list[PrefixViolation]:
+    """直接对一个 messages 序列列表做前缀扫描（切窗后比的是窗口内容）。"""
+    order = list(range(len(sequences)))
     if len(order) < 2:
         return []
-    seqs = {idx: sequence_bytes(get_messages(records[idx]), fields=fields) for idx in order}
+    records = sequences
+    seqs = {idx: sequence_bytes(records[idx], fields=fields) for idx in order}
     order.sort(key=lambda i: -i)
     order.sort(key=lambda i: seqs[i])
     violations: list[PrefixViolation] = []

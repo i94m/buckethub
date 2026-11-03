@@ -95,6 +95,9 @@ def _shard_config(args: argparse.Namespace, fake_tokens: bool) -> shard.ShardCon
         shard_max_bytes=int(args.shard_max_mb * shard.MIB),
         shard_slack=args.shard_slack,
         glob=args.shard_glob,
+        allow_top_level_window_messages=bool(
+            getattr(args, "allow_top_level_window_messages", False)
+        ),
     )
     if fake_tokens:
         # 占位计数器下 token 阈值没有物理意义，放宽到字符量级避免误判。
@@ -161,7 +164,7 @@ def run_verify(
     counter: _Counter,
     cfg: shard.ShardConfig,
     check_prefix_invariant: bool = True,
-    required_steps: Sequence[str] = ledger.CANONICAL_STEPS,
+    required_steps: Sequence[str] = ledger.CORE_STEPS,
     allow_missing_steps: bool = False,
 ) -> dict[str, Any]:
     delivery_dir = Path(delivery_dir)
@@ -336,7 +339,7 @@ def run_recount(
                         {
                             "shard": path.name,
                             "line": lineno,
-                            "variants": tokens.variant_counts(record),
+                            "variants": tokens.variant_counts(record, line=raw),
                         }
                     )
             if len(diagnostics) >= diagnose:
@@ -568,7 +571,7 @@ def _selftest_mutations(
     def _unknown_step(path: Path) -> None:
         manifest_file = path / "manifest.json"
         raw = json.loads(manifest_file.read_text(encoding="utf-8"))
-        raw["files"][0]["removed"]["mystery_stage"] = 0
+        raw["files"][0]["removed"]["mystery_stage"] = 3
         manifest_file.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
 
     def _token_mismatch(path: Path) -> None:
@@ -665,6 +668,11 @@ def _add_config_args(parser: argparse.ArgumentParser) -> None:
         choices=("auto", "tiktoken", "chars"),
         default="auto",
         help="auto/tiktoken = 真算；chars = 占位实现，必须配 --allow-fake-tokenizer",
+    )
+    parser.add_argument(
+        "--allow-top-level-window-messages",
+        action="store_true",
+        help="放行「窗口内容写在顶层 messages」的切窗形态（默认判错，需双方确认口径后再开）",
     )
     parser.add_argument(
         "--allow-fake-tokenizer",

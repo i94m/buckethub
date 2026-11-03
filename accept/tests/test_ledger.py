@@ -170,7 +170,7 @@ class ReconcileTest(unittest.TestCase):
         raw = _manifest()
         raw["shards"][0]["records"] = 41
         problems = ledger.reconcile(ledger.normalize_manifest(raw))
-        self.assertTrue(any("分片条数之和" in m for m in _errors(problems)))
+        self.assertTrue(any("分片行数之和" in m for m in _errors(problems)))
 
     def test_shard_records_account_for_window_pieces(self):
         files = [_file()]
