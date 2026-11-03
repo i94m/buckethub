@@ -38,6 +38,7 @@ FILTER_LABELS = {
     "filter_rs_id": "缺 rs_id",
     "filter_encrypted_content": "缺密文 part",
     "filter_min_messages": "不足 100 条",
+    "filter_has_image": "含图（A1 整条剔除）",
 }
 
 
@@ -136,7 +137,8 @@ def _filter_reason(record: dict, messages: Sequence[Any], min_messages: int) -> 
         return "parse_errors"
     if not dedup.session_group_key(dedup.get_session_id(record)):
         return "filter_no_session_id"
-    from .shard import has_encrypted_part, rs_ids
+    from . import shard as shard_mod
+    has_encrypted_part, rs_ids = shard_mod.has_encrypted_part, shard_mod.rs_ids
 
     if not rs_ids(record):
         return "filter_rs_id"
@@ -144,6 +146,9 @@ def _filter_reason(record: dict, messages: Sequence[Any], min_messages: int) -> 
         return "filter_encrypted_content"
     if len(messages) < min_messages:
         return "filter_min_messages"
+    # A1：含图整条剔除，与开发侧同序（放在最后一道，只度量"本可交付"的量）
+    if shard_mod.has_image_part(record):
+        return "filter_has_image"
     return None
 
 

@@ -40,7 +40,7 @@ CORE_STEPS = (
 
 #: 可选阶段：有的实现在过滤阶段额外丢掉没有 session_id 的记录；停止后未交付部分
 #: 也必须单独记账（``stop_cut``），否则对账少一截。
-OPTIONAL_STEPS = ("filter_no_session_id", "stop_cut")
+OPTIONAL_STEPS = ("filter_no_session_id", "filter_has_image", "stop_cut")
 
 CANONICAL_STEPS = CORE_STEPS + OPTIONAL_STEPS
 
@@ -145,7 +145,7 @@ class FileLedger:
         return sum(
             self.removed.get(step, 0)
             for step in ("parse_errors", "filter_no_session_id", "filter_rs_id",
-                         "filter_encrypted_content", "filter_min_messages")
+                         "filter_encrypted_content", "filter_min_messages", "filter_has_image")
         )
 
     @property
@@ -267,6 +267,9 @@ def classify_step(name: str) -> str | None:
         return "dedupe_prefix"
     if "session" in key:
         return "dedupe_session"
+    if "image" in key:
+        # A1：整条丢弃含图记录
+        return "filter_has_image"
     if "encrypt" in key:
         return "filter_encrypted_content"
     if "stop" in key or "cut" in key:

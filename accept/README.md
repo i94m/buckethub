@@ -404,3 +404,17 @@ A' 路径下 verify 保持严格，只有 B 路径（含图交付）点火时才
 而本地 `--raw-dir` 里只有文件名。`crosscheck` 先做精确匹配，再按**末段**匹配，
 并在报告 `key_matching` 里写明每条用了哪种方式；末段重名（不同前缀的同名文件）会标
 `ambiguous_basename`，不静默串味。
+
+## 十五、A1 口径（整条丢弃含图记录）的验收适配
+
+开发侧在 index 期按 `has_image` 剔除含图记录后，验收侧三处同步：
+
+| 位置 | 变化 |
+| --- | --- |
+| `ledger.classify_step` | `has_image` / `filter_has_image` → `filter_has_image`（**可选步骤**：老交付没有该项不算缺账） |
+| 过滤段闭合 | `filter_total` 计入 `filter_has_image`，即 `passed = scanned − 各过滤原因（含 has_image）` |
+| `crosscheck` | 独立重算同样剔除含图记录，逐文件 `filter_has_image` 两侧必须相等 |
+
+判据与开发侧同一份：`content[]` 任一 part 的 `type` ∈ `input_image` / `image_url` /
+`input_image_url`，或 part 带 `image_url` 字段。**整条丢、不剥 part**。
+`crosscheck` 的 `per_file.filters` 里会直接看到 `filter_has_image: [开发侧, 验收侧]`。

@@ -114,6 +114,24 @@ def get_messages(record: Any) -> list:
     return dedup.get_messages(record)
 
 
+IMAGE_PART_TYPES = ("input_image", "image_url", "input_image_url")
+
+
+def has_image_part(record: Any) -> bool:
+    """A1 口径：任一 message 的 content[] 含图片 part（与开发侧同一份判据）。"""
+    for message in get_messages(record):
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        parts = content if isinstance(content, list) else []
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") in IMAGE_PART_TYPES or "image_url" in part:
+                return True
+    return False
+
+
 def has_encrypted_part(record: Any) -> bool:
     """``request.messages[].content[]`` 里是否有 ``type=encrypted_content`` 的 part。"""
     for message in get_messages(record):
