@@ -109,6 +109,8 @@ python pipeline/corpus_pipeline.py --execute --reset --out-dir ./corpus_out
 ```json
 {
   "STOP_REASON": "token_target_reached | corpus_exhausted",
+  "stop_after_record": {"id": "…jsonl#12345", "key": "…jsonl", "off": 12345,
+                        "n_msgs": 260, "windows": 3, "tokens": 186022, "tokens_total_after": 1000000123},
   "delivered_tokens": 1000000123,
   "delivered_samples": 2810,
   "kept_records": 2815,
@@ -128,22 +130,26 @@ passed  = session_removed + prefix_removed + kept_records
 kept    = delivered_records + not_delivered
 ```
 
-超过 128k token 的单条会被切成多行，切开的行带 `_window` 字段：
+超过 128k token 的单条会被切成多行。**窗口写回 `request.messages`**，其余字段（`session_id`、`request_id`、`response`、`request.model`、`request.tools` …）原样保留，下游按真实 schema 读取，路径不变：
 
 ```json
-{"session_id": "…", "request": {"messages": [...]}, "_window": {"index": 0, "of": 3,
- "source": {"key": "Gpt-2026-10-18/xxx.jsonl", "off": 123}, "messages_total": 1234,
- "oversize_message": 0}}
+{"session_id": "…", "request_id": "…", "request": {"model": "…", "tools": [...],
+  "messages": [ /* 本窗口的消息，逐条 token 之和 ≤ 128k */ ]},
+ "response": {...}, "model": "…",
+ "_window": {"index": 0, "of": 3, "source": {"key": "Gpt-2026-10-18/xxx.jsonl", "off": 123},
+             "messages_total": 1234, "oversize_message": 0}}
 ```
 
+同一记录的所有窗口行 `index` 从 0 连续到 `of-1`，把它们的 `request.messages` 依次拼接即还原原始消息序列。
 未切窗的记录原样输出（字节不变），不带 `_window`。
 
 ## 五、中断与恢复
 
 - 三阶段都可重入：**重跑同一条命令即可**，进度都在 `state.json` + `emit.journal`。
 - `index`：已完成的 key 记在 `state.json`，跳过不重扫；续跑且目标提高时会自动清掉上一轮提前止损标记，继续拉新文件。
-- `plan`：秒级，幂等，重跑覆盖 `keep.jsonl`。
+- `plan`：幂等。每次重跑先清零 `session_removed` / `prefix_removed` 再按文件重建，同一目录连跑多次数字不变（有回归用例）。
 - `emit`：以 `emit.journal` 为准重建分片账本——启动时把分片尾部**未入账的半行截断**，已交付的 `id` 不会重复写；最后一个分片未满则继续追加，满了才开新片。
+- `emit` 的最小提交单位是**一条记录的整组窗口**：过线时要么整组一起落、要么整组不落，落完才停，不会出现 `window 0 of 3` 已交付、`1..2` 被丢的情况。`manifest.stop_after_record` 记录停在哪条记录上。
 - 想从零开始：`--reset`（清 `state.json`；`index.jsonl`/`keep.jsonl` 保留，删掉它们才是彻底重来）。
 
 ## 六、耗时与磁盘预算（按实测）
@@ -161,7 +167,7 @@ kept    = delivered_records + not_delivered
 只跑本地合成数据，不联网、不下载：
 
 ```bash
-python -m unittest discover -s pipeline/tests -v
+python -m unittest discover -s pipeline/tests -v   # 38 例
 ```
 
 覆盖：
@@ -171,10 +177,12 @@ python -m unittest discover -s pipeline/tests -v
 - 前缀去重：`abcde`/`abcdefg`、完全相同、同长不同内容、跨 session 前缀、共享前 k 个元素后分叉的负例、线性长链、空 messages，以及"先 session 后前缀"的顺序不串账。
 - 切窗：未超限不切、按累计 token 切、单条超限独占一窗。
 - 端到端（本地目录）：dry-run 不落盘、全流程与账本闭合、分片轮转且不超阈值、`STOP_REASON=token_target_reached`、续跑不重复、切窗输出形态。
+- **联调回归（5 条，都是先红后绿）**：窗口写回 `request.messages` 且其余字段保留；过线不拦腰截断窗口组、`manifest.stop_after_record` 可定位；`plan` 连跑三次数字不变；首次运行逐文件交付计数非 0 且与 manifest 总量一致。
 
 ## 八、已知取舍
 
 - **index 阶段必须读到"预估过线"为止**：全局前缀去重需要看到全部候选序列，不能只看单个文件。停在预估线（`target × 1.15`）是为了省掉剩余文件的下载。
-- **分片是"不超阈值"**：写之前判断，所以每包 ≤ 500 MB，但可能略小于 500 MB（单条 1~8 MB 时误差可忽略）。
+- **分片是"软上限"**：换包在写入前判断、且以「整组窗口」为单位，所以每包 ≤ 500 MB——**前提是单条记录的整组窗口不超过阈值**。默认 500 MB 下不会触发（单条记录 1~8 MB）；若把 `--shard-bytes` 调到很小或遇到超长单条，某一包会超过阈值，此时以「不切断窗口组」优先。
+- **`delivered_tokens` 可能略超目标**：因为窗口组原子提交，过线的那一组会整组落盘，最多超出*一条记录*的 token 量（前缀去重后单条均值 356k）。
 - **超长单条**：`messages` 里单条 message 自身的 token 就超过 128k 时，它会独占一个窗口并在 `_window.oversize_message` 计数——这是数据问题，不应静默丢弃。
 - token 数含 `encrypted_content` 密文（口径 5）；如需"仅可读文本"口径，需另跑一版，两者不可混用。

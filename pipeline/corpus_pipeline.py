@@ -417,6 +417,10 @@ def phase_plan(args, state, ledger, out_dir: Path):
     (out_dir / "keep.jsonl").write_text(
         "".join(json.dumps({k: (v.hex() if k == "seq" else v) for k, v in it.items()},
                            ensure_ascii=False) + "\n" for it in kept), encoding="utf-8")
+    # 幂等：先清零该阶段计数，再按文件重建（plan 可以反复重跑，不能累加）
+    for row in ledger.files.values():
+        row["session_removed"] = 0
+        row["prefix_removed"] = 0
     for it in result["session_removed"]:
         ledger.file(it["key"])["session_removed"] += 1
     for it in result["prefix_removed"]:
@@ -424,10 +428,16 @@ def phase_plan(args, state, ledger, out_dir: Path):
     ledger.meta["exact_dup"] = result["exact_dup"]
     state.data["ledger"] = ledger.files
     state.save()
+    write_ledger_json(out_dir, ledger)
     print(f"[plan] 输入 {len(items)} → session 移除 {len(result['session_removed'])} "
           f"→ 前缀移除 {len(result['prefix_removed'])}（其中完全重复 {result['exact_dup']}）"
           f" → 保留 {len(kept)}")
     return kept
+
+
+def write_ledger_json(out_dir: Path, ledger):
+    (out_dir / "ledger.json").write_text(
+        json.dumps({"files": ledger.files, "totals": ledger.totals()}, ensure_ascii=False, indent=1))
 
 
 def _load_journal(jpath: Path):
@@ -445,7 +455,7 @@ def _rebuild_shards(out_dir: Path, entries):
     for e in entries:
         s = shards.setdefault(e["shard"], {"file": f"deliver-{e['shard']:04d}.jsonl",
                                            "samples": 0, "bytes": 0, "tokens": 0})
-        s["samples"] += 1
+        s["samples"] += e.get("lines", 1)
         s["bytes"] += e["bytes"]
         s["tokens"] += e["tokens"]
     for no, info in shards.items():
@@ -495,6 +505,7 @@ def phase_emit(args, state, ledger, out_dir: Path):
         shards[cur_no] = cur
         shard_fh = open(out_dir / cur["file"], "ab")
 
+    stop_after_record = None
     try:
         for it in kept:
             if it["id"] in done:
@@ -511,35 +522,46 @@ def phase_emit(args, state, ledger, out_dir: Path):
             msgs = messages_of(rec)
             windows, window_tokens, oversize = split_windows(msgs, encoder, args.max_sample_tokens)
 
+            # 整组窗口是最小提交单位：先全部拼好，再决定换不换分片，最后一起落盘 + 一笔入账
+            group = []
             for wi, (window, tok) in enumerate(zip(windows, window_tokens)):
-                if written_tokens >= args.target_tokens:
-                    stop_reason = "token_target_reached"
-                    break
                 if len(windows) == 1:
                     line = raw if raw.endswith(b"\n") else raw + b"\n"
                 else:
                     out_rec = dict(rec)
-                    out_rec["messages"] = window
+                    # 裁决：窗口写回 request.messages，其余字段原样保留（下游读取路径不变）
+                    out_rec["request"] = {**(rec.get("request") or {}), "messages": window}
                     out_rec["_window"] = {"index": wi, "of": len(windows),
                                           "source": {"key": it["key"], "off": it["off"]},
                                           "messages_total": len(msgs), "oversize_message": oversize}
                     line = (json.dumps(out_rec, ensure_ascii=False) + "\n").encode()
-                if cur["bytes"] + len(line) > args.shard_bytes and cur["samples"] > 0:
-                    rotate()
+                group.append((line, tok))
+
+            group_bytes = sum(len(ln) for ln, _ in group)
+            group_tokens = sum(tok for _, tok in group)
+            if cur["samples"] > 0 and cur["bytes"] + group_bytes > args.shard_bytes:
+                rotate()
+            for line, _ in group:
                 shard_fh.write(line)
-                shard_fh.flush()
-                cur["bytes"] += len(line)
-                cur["samples"] += 1
-                cur["tokens"] += tok
-                journal_fh.write(json.dumps({"id": it["id"], "key": it["key"], "shard": cur_no,
-                                             "bytes": len(line), "tokens": tok}) + "\n")
-                journal_fh.flush()
-                written_tokens += tok
-                total_samples += 1
-                done.add(it["id"])
-            if len(done) % 200 == 0 and total_samples:
+            shard_fh.flush()
+            cur["bytes"] += group_bytes
+            cur["samples"] += len(group)
+            cur["tokens"] += group_tokens
+            journal_fh.write(json.dumps({"id": it["id"], "key": it["key"], "shard": cur_no,
+                                         "bytes": group_bytes, "tokens": group_tokens,
+                                         "lines": len(group)}) + "\n")
+            journal_fh.flush()
+            written_tokens += group_tokens
+            total_samples += len(group)
+            done.add(it["id"])
+            stop_after_record = {"id": it["id"], "key": it["key"], "off": it["off"],
+                                 "n_msgs": len(msgs), "windows": len(group),
+                                 "tokens": group_tokens, "tokens_total_after": written_tokens}
+
+            if len(done) % 200 == 0:
                 print(f"[emit] {total_samples} 行 / {written_tokens/1e6:.1f}M token")
-            if stop_reason:
+            if written_tokens >= args.target_tokens:
+                stop_reason = "token_target_reached"
                 break
     finally:
         shard_fh.flush()
@@ -549,20 +571,24 @@ def phase_emit(args, state, ledger, out_dir: Path):
     if not stop_reason:
         stop_reason = "token_target_reached" if written_tokens >= args.target_tokens else "corpus_exhausted"
 
-    # 账本按 journal 重算（续跑不重复计数）
+    # 账本按 journal 重算（续跑不重复计数）；快照必须在本次全部写完之后再取
+    entries = _load_journal(jpath)
+    written_tokens = sum(e["tokens"] for e in entries)
+    total_samples = sum(e.get("lines", 1) for e in entries)
     for row in ledger.files.values():
         row["delivered_records"] = 0
         row["delivered_windows"] = 0
     seen_records = set()
     for e in entries:
         row = ledger.file(e["key"])
-        row["delivered_windows"] += 1
+        row["delivered_windows"] += e.get("lines", 1)
         if e["id"] not in seen_records:
             seen_records.add(e["id"])
             row["delivered_records"] += 1
 
     state.data["emit"] = {"stop_reason": stop_reason, "tokens": written_tokens,
                           "total_samples": total_samples,
+                          "stop_after_record": stop_after_record,
                           "shards": [shards[k] for k in sorted(shards)]}
     state.save()
     print(f"[emit] 交付 {total_samples} 行 / {written_tokens:,} token / 停止原因 {stop_reason}")
@@ -579,6 +605,7 @@ def write_manifest(args, state, ledger, out_dir: Path, delivered_tokens, stop_re
     manifest = {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "STOP_REASON": stop_reason,
+        "stop_after_record": emit.get("stop_after_record"),
         "target_tokens": args.target_tokens,
         "delivered_tokens": delivered_tokens,
         "delivered_samples": emit.get("total_samples", 0),
@@ -598,8 +625,7 @@ def write_manifest(args, state, ledger, out_dir: Path, delivered_tokens, stop_re
                   "stop_reason": state.data["index"].get("stop_reason")},
     }
     (out_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2))
-    (out_dir / "ledger.json").write_text(
-        json.dumps({"files": ledger.files, "totals": ledger.totals()}, ensure_ascii=False, indent=1))
+    write_ledger_json(out_dir, ledger)
     return manifest
 
 

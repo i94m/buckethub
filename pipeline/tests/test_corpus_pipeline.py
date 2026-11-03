@@ -376,3 +376,172 @@ class TestEndToEnd(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# ---------------------------------------------------------------- 联调回归用例
+# 2026-11-03 联调（常小玲独立重算）发现的 4 个真 bug，每条用例都能在修复前复现。
+
+class _PipelineCase(unittest.TestCase):
+    """公共脚手架：本地目录模式跑全流程。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.src = self.root / "src"
+        self.src.mkdir()
+        self.out = self.root / "out"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_pipeline(self, *extra):
+        return cp.main(["--execute", "--local-dir", str(self.src), "--out-dir", str(self.out)] + list(extra))
+
+    def manifest(self):
+        return json.loads((self.out / "manifest.json").read_text())
+
+    def ledger(self):
+        """优先读 ledger.json；只跑 plan 阶段的旧版本没有该文件，回退到 state.json 里的账本。"""
+        path = self.out / "ledger.json"
+        if path.exists():
+            return json.loads(path.read_text())
+        state = json.loads((self.out / "state.json").read_text())
+        files = state.get("ledger") or {}
+        totals = {}
+        for row in files.values():
+            for key, val in row.items():
+                if isinstance(val, int):
+                    totals[key] = totals.get(key, 0) + val
+        for key, val in (state.get("ledger_meta") or {}).items():
+            totals[key] = val
+        return {"files": files, "totals": totals}
+
+    def delivered(self):
+        lines = []
+        for shard in self.manifest()["shards"]:
+            lines += [json.loads(ln) for ln in (self.out / shard["file"]).read_text().splitlines()]
+        return lines
+
+
+class TestRegressionWindowTarget(_PipelineCase):
+    """① 切窗必须写回 request.messages（裁决：下游按真实 schema 读）。"""
+
+    def setUp(self):
+        super().setUp()
+        try:
+            import tiktoken
+        except Exception:
+            self.skipTest("tiktoken 未安装，跳过真分词回归用例")
+        self.enc = tiktoken.get_encoding("o200k_base")
+
+    def test_window_goes_into_request_messages(self):
+        rec = make_record(uuid="u1", n=100)
+        # 其余字段必须原样保留（裁员会看 request 里的 model/tools 和顶层字段）
+        rec["request"]["model"] = "gpt-6-astra"
+        rec["request"]["tools"] = [{"type": "function", "name": "shell"}]
+        rec["request"]["prompt_cache_key"] = "cache-key"
+        write_dataset(self.src, [rec])
+        self.run_pipeline("--target-tokens", "1000000000", "--max-sample-tokens", "150")
+
+        lines = self.delivered()
+        self.assertGreater(len(lines), 1, "用例前提：该记录必须被切成多个窗口")
+
+        for ln in lines:
+            self.assertIn("request", ln)
+            self.assertNotIn("messages", ln, "窗口不允许写在顶层 messages")
+            wm = ln["request"]["messages"]
+            self.assertLessEqual(cp.count_tokens(wm, self.enc), 150,
+                                 f"窗口按 request.messages 复算超出 128k 口径（实际 {len(wm)} 条）")
+
+        total = sum(len(ln["request"]["messages"]) for ln in lines)
+        self.assertEqual(total, 100, "所有窗口的 request.messages 必须拼回原始 100 条")
+        for ln in lines:
+            self.assertEqual(ln["request"]["model"], "gpt-6-astra")
+            self.assertEqual(ln["request"]["prompt_cache_key"], "cache-key")
+            self.assertEqual(ln["request"]["tools"], [{"type": "function", "name": "shell"}])
+            self.assertEqual(ln["session_id"], "u1~ua")
+        self.assertEqual([ln["_window"]["index"] for ln in lines], list(range(len(lines))))
+        self.assertTrue(all(ln["_window"]["messages_total"] == 100 for ln in lines))
+
+
+class TestRegressionWindowGroupAtomicity(_PipelineCase):
+    """④ 到 1B 时不能把一组窗口拦腰截断。"""
+
+    def setUp(self):
+        super().setUp()
+        try:
+            import tiktoken
+        except Exception:
+            self.skipTest("tiktoken 未安装，跳过真分词回归用例")
+
+    def test_stop_keeps_whole_window_group(self):
+        write_dataset(self.src, [make_record(uuid="u1", n=100)])
+        # 目标 1 token：第一条记录的第一个窗口就"过线"，但整组必须一起落
+        self.run_pipeline("--target-tokens", "1", "--max-sample-tokens", "150")
+
+        lines = self.delivered()
+        man = self.manifest()
+        self.assertGreater(len(lines), 1)
+        self.assertEqual(man["STOP_REASON"], "token_target_reached")
+        # 组内连续、无缺口（拦腰截断的特征就是 index 缺尾）
+        self.assertEqual([ln["_window"]["index"] for ln in lines], list(range(len(lines))))
+        self.assertTrue(all(ln["_window"]["of"] == len(lines) for ln in lines))
+        self.assertEqual(man["not_delivered"], 0)
+        self.assertEqual(man["delivered_records"], 1)
+
+    def test_manifest_records_where_it_stopped(self):
+        write_dataset(self.src, [make_record(uuid=f"u{i}", n=100, seed=f"s{i}") for i in range(3)])
+        self.run_pipeline("--target-tokens", "1", "--max-sample-tokens", "150")
+        man = self.manifest()
+        self.assertIn("stop_after_record", man)
+        self.assertTrue(man["stop_after_record"]["id"])
+        self.assertEqual(man["stop_after_record"]["id"],
+                         self.manifest()["shards"] and man["stop_after_record"]["id"])
+
+
+class TestRegressionPlanIdempotent(_PipelineCase):
+    """③ plan 重跑不能重复累计移除量。"""
+
+    def test_plan_three_runs_stable(self):
+        base = make_record(uuid="u1", n=100, seed="a")
+        longer = make_record(uuid="u2", n=104, seed="a")
+        longer["request"]["messages"] = copy.deepcopy(base["request"]["messages"]) + [
+            msg("u2-100"), msg("u2-101"), msg("u2-102"), msg("u2-103")]
+        same_session = make_record(uuid="u3", n=100, seed="c")
+        same_session_long = make_record(uuid="u3", n=105, seed="c")
+        same_session_long["request"]["messages"] = copy.deepcopy(same_session["request"]["messages"]) + [
+            msg("u3-extra") for _ in range(5)]
+        write_dataset(self.src, [base, longer, same_session, same_session_long])
+
+        self.run_pipeline("--phase", "index")
+        snapshots = []
+        for i in range(3):
+            self.run_pipeline("--phase", "plan")
+            led = self.ledger()
+            snapshots.append((led["totals"]["session_removed"],
+                              led["totals"]["prefix_removed"],
+                              led["totals"].get("exact_dup", 0)))
+
+        self.assertEqual(snapshots[0], (1, 1, 0), f"首轮移除量不对：{snapshots[0]}")
+        self.assertEqual(snapshots[0], snapshots[1], "plan 第二次重跑改变了移除量")
+        self.assertEqual(snapshots[1], snapshots[2], "plan 第三次重跑改变了移除量")
+
+
+class TestRegressionDeliveredLedger(_PipelineCase):
+    """② 首次运行的逐文件交付计数不能是 0。"""
+
+    def test_first_run_ledger_counts(self):
+        write_dataset(self.src, [make_record(uuid=f"u{i}", n=100, seed=f"s{i}") for i in range(4)])
+        self.run_pipeline("--target-tokens", "1000000000")
+
+        man = self.manifest()
+        led = self.ledger()
+        per_file_records = sum(f["delivered_records"] for f in led["files"].values())
+        per_file_windows = sum(f["delivered_windows"] for f in led["files"].values())
+
+        self.assertGreater(man["delivered_records"], 0)
+        self.assertEqual(per_file_records, man["delivered_records"],
+                         "ledger.json 逐文件交付条数之和必须等于 manifest 总量")
+        self.assertEqual(per_file_windows, man["delivered_samples"])
+        self.assertEqual(man["ledger"]["delivered_records"], man["delivered_records"])
+        self.assertEqual(man["ledger"]["delivered_windows"], man["delivered_samples"])
