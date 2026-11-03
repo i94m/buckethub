@@ -1,0 +1,3 @@
+# 验收侧唯一的外部依赖：真 token 计数只认 tiktoken o200k_base。
+# 没有它时：单测里依赖真分词的用例 skip，CLI 以退出码 3 显式失败（不会降级）。
+tiktoken>=0.7
