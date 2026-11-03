@@ -61,6 +61,7 @@ python delivery/delivery_pack.py <OUT>/full --execute --date 2026-11-04
 | `files[]` | 每个源文件：`source_key`、`status`、`records`、`windows`、`tokens`、两种字节数、两种 sha256、`parts[]` |
 | `files[].parts[]` | 每片：`name`、`windows`、`tokens`、`bytes_raw`/`bytes_zst`、`sha256_raw`/`sha256_zst` |
 | `objects[]` | 桶内每个分片对象：`key`、`size`、`sha256`（压缩后）、`sha256_raw`（未压缩） |
+| `provenance` | 多机合并时的来源：`machines`、`shards_per_machine`、`merged_from`、`multi_machine` |
 | `object_count` | 期望对象总数 = 分片数 + 2（清单 + README） |
 | `pipeline` | 上游 `manifest.json` 的停止原因/停止文件/token/`manifest.json` 自身 sha256 |
 
@@ -84,7 +85,28 @@ python delivery/delivery_pack.py <OUT>/full --execute --date 2026-11-04
 - `delivery-manifest.json` / `README.md` 在内容不变时**逐字节复用**（不重写 `generated_at`），
   否则每次重跑的哈希都会变，续跑会被自己判成「同名不同内容」。
 
-## 四、上传后校验
+## 四、多机多片合并后的交付目录
+
+打包这一层不假设"一个源文件只产一片、只有一台机器在跑"。合并目录（多源 key、
+同源多 `part`、分片住在 `machine-a/` 这类子目录里、`STOP_REASON=merged`、
+可选的 `machine` / `host` 来源字段）可以直接喂进来：
+
+- **对象名扁平化**：`machine-a/gpt-….part-0001.jsonl` → `gpt-….part-0001.jsonl.zst`，
+  桶里不会多出一层机器目录；不同子目录里同名的分片会当场报错（否则上传会互相覆盖）。
+- **形状体检（硬失败，退出码 2）**：同一源文件的 `part` 必须从 1 连续、不许重号；
+  分片重名；`delivered_files[].parts` 与实际片数不符；`delivered_records` /
+  `delivered_samples` 与逐片之和对不上（合并后 totals 没重算的典型症状）；
+  `status=delivered` 但一片都没有。分片对应的 `source_key` 不在 `delivered_files`
+  里只警告（records/status 会留空）。
+- **totals 重算**：打包侧永远按实际分片重算 `totals`（文件数/片数/行数/token/两种字节），
+  再与合并清单的 `delivered_tokens` / `delivered_samples` 交叉核对，不一致直接停。
+- **来源可追溯**：清单 `provenance`（`machines`、`shards_per_machine`、`merged_from`）、
+  逐文件 `files[].machines`、逐对象 `objects[].machine`；桶上另有 `x-amz-meta-machine`。
+  README 在多机时自动加"来源机"一列。
+- **停因**：默认接受 `corpus_exhausted` / `token_target_reached` / `merged`；
+  合并层若用别的终态名，用 `--allow-stop-reason <REASON>` 显式放行。
+
+## 五、上传后校验
 
 1. 每个对象上传后立刻 `head_object`：`ContentLength` == 本地字节数，且
    `x-amz-meta-sha256` == 本地压缩后 sha256（不符 → 退出码 4）。
@@ -93,7 +115,7 @@ python delivery/delivery_pack.py <OUT>/full --execute --date 2026-11-04
    也全文回读比对。
 4. 结果写 `upload-report.json`；命令行打印「上传 N / 重传 N / 跳过 N / 回读 N 一致」。
 
-## 五、退出码
+## 六、退出码
 
 | 码 | 含义 |
 | --- | --- |
@@ -103,7 +125,7 @@ python delivery/delivery_pack.py <OUT>/full --execute --date 2026-11-04
 | 4 | 上传后校验失败（大小、元数据、对象集合、回读 sha256） |
 | 137 | 自测注入中断（`--simulate-fail-after`） |
 
-## 六、前置校验（不通过直接退出码 2）
+## 七、前置校验（不通过直接退出码 2）
 
 - `manifest.json` 存在且 `STOP_REASON ∈ {corpus_exhausted, token_target_reached}`；
   `segment_paused` 明确拒绝（那是分段中间态，不是终态）。
@@ -114,10 +136,10 @@ python delivery/delivery_pack.py <OUT>/full --execute --date 2026-11-04
 - 分片 token 之和 == `manifest.delivered_tokens`；逐文件与 `ledger.json` 的
   `delivered_windows` / `delivered_tokens` 对得上。
 
-## 七、自测（离线，不需要凭证）
+## 八、自测（离线，不需要凭证）
 
 ```bash
-python -m unittest discover -s delivery/tests -v     # 13 例
+python -m unittest discover -s delivery/tests -v     # 20 例
 ```
 
 合成交付目录由 `pipeline/corpus_pipeline.py --local-dir` 真跑产生（不是手写 manifest），
@@ -126,7 +148,12 @@ python -m unittest discover -s delivery/tests -v     # 13 例
 上传路径用 `--simulate-local-s3 <dir>`（本地假 S3，不联网）；
 `--simulate-fail-after N` 模拟第 N 个 put 时进程被杀。
 
-## 八、磁盘与耗时预算
+另有一组**合并目录**用例：两台"机器"各自真跑一遍 pipeline，再按
+`<machine>/<分片>` 合成 3 源 key / 4 分片 / 2 机的合并目录，验 dry-run、
+清单自洽（合并 totals、同源多片的聚合 sha256）、上传校验，以及断号/重号/
+totals 没重算三种合并事故都会被拦下。
+
+## 九、磁盘与耗时预算
 
 - 额外磁盘 ≈ 压缩后体积（JSONL 文本 zstd level 10 约 1/8~1/12），默认就写在交付目录的
   `_delivery_pack/` 下；磁盘紧就用 `--staging-dir` 指到别处。

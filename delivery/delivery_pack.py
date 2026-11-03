@@ -135,11 +135,16 @@ class Part:
     path: Path
     windows: int
     tokens: int
+    machine: str = ""
 
     @property
     def name(self) -> str:
-        """压缩后对象名：分片名直接加 .zst（<主干>.part-0001.jsonl -> ....jsonl.zst）。"""
-        return self.shard_name + ".zst"
+        """压缩后对象名：分片文件名加 .zst。
+
+        合并目录里的分片可能住在子目录里（``machine-a/gpt-....jsonl``）：对象名只取
+        文件名，避免桶里多出一层目录；同名冲突在 inspect 阶段就报错。
+        """
+        return Path(self.shard_name).name + ".zst"
 
 
 @dataclass
@@ -150,6 +155,10 @@ class SourceFile:
     records: int
     tokens: int
     parts: list = field(default_factory=list)
+
+    @property
+    def machines(self) -> list:
+        return sorted({p.machine for p in self.parts if p.machine})
 
 
 @dataclass
@@ -171,11 +180,98 @@ class Delivery:
     def records(self) -> int:
         return sum(s.records for s in self.sources)
 
+    @property
+    def machines(self) -> list:
+        return sorted({p.machine for p in self.parts if p.machine})
+
+    @property
+    def merged_from(self) -> list:
+        v = self.manifest.get("merged_from") or self.manifest.get("merge_sources") or []
+        return [str(x) for x in v] if isinstance(v, list) else [str(v)]
+
+
+TERMINAL_STOP_REASONS = ("corpus_exhausted", "token_target_reached", "merged")
+
+
+def _machine_of(row: dict) -> str:
+    """合并目录里的来源机：machine / host / worker 任一字段（都没有就留空）。"""
+    for k in ("machine", "host", "worker", "source_machine"):
+        v = row.get(k)
+        if v:
+            return str(v)
+    return ""
+
+
+def _check_merge_shape(parts: list, delivered: dict, manifest: dict) -> None:
+    """合并目录的形状体检：重名、重号、断号、totals 与逐片对不上。
+
+    单机产物天然满足这些；出错基本只有一种原因——合并时漏了/重了某一片，
+    或者 totals 是从某一台机器抄来的而不是重算的。
+    """
+    names = {}
+    for p in parts:
+        names.setdefault(p.name, []).append(p.shard_name)
+    clash = {k: v for k, v in names.items() if len(v) > 1}
+    if clash:
+        raise DeliveryError(
+            "合并后对象名冲突（不同子目录里同名分片，桶里会互相覆盖）："
+            + "；".join(f"{k} <- {v}" for k, v in clash.items()))
+
+    slots = {}
+    for p in parts:
+        slots.setdefault((p.source_key, p.part), []).append(p.shard_name)
+    dup = {k: v for k, v in slots.items() if len(v) > 1}
+    if dup:
+        raise DeliveryError(
+            "同一源文件的同一 part 出现多片（合并时重复计入）："
+            + "；".join(f"{k[0]} part-{k[1]:04d} <- {v}" for k, v in dup.items()))
+
+    for key in sorted({p.source_key for p in parts}):
+        got = sorted(p.part for p in parts if p.source_key == key)
+        if got != list(range(1, len(got) + 1)):
+            raise DeliveryError(
+                f"{key} 的 part 编号不是 1..{len(got)} 连续：{got}（合并时漏片或重编号）")
+
+    for key, row in delivered.items():
+        mine = [p for p in parts if p.source_key == key]
+        if int(row.get("parts") or 0) and int(row["parts"]) != len(mine):
+            raise DeliveryError(
+                f"{key} 在 manifest.delivered_files 里写 {row['parts']} 片，"
+                f"实际 {len(mine)} 片")
+        if row.get("status") == "delivered" and not mine:
+            raise DeliveryError(f"{key} 状态是 delivered，但合并目录里一片都没有")
+    if delivered:
+        for key in sorted({p.source_key for p in parts}):
+            if key not in delivered:
+                print(f"[warn] 分片对应的 source_key 不在 delivered_files 里：{key}"
+                      f"（合并清单不完整，records/status 会留空）")
+
+    if manifest.get("delivered_records") is not None and delivered:
+        rec = sum(int(f.get("records") or 0) for f in delivered.values())
+        if int(manifest["delivered_records"]) != rec:
+            raise DeliveryError(
+                f"manifest.delivered_records={manifest['delivered_records']} ≠ "
+                f"delivered_files[].records 之和 {rec}（合并后 totals 没重算）")
+
+    if manifest.get("delivered_samples") is not None:
+        win = sum(int(x.get("samples") or 0) for x in manifest.get("shards") or [])
+        if win and int(manifest["delivered_samples"]) != win:
+            raise DeliveryError(
+                f"manifest.delivered_samples={manifest['delivered_samples']} ≠ "
+                f"shards[].samples 之和 {win}（合并后 totals 没重算）")
+
 
 def inspect_delivery(root: Path, allow_lock: bool = False, lock_ttl: int = 300,
                      allow_count_mismatch: bool = False,
-                     allow_closure_mismatch: bool = False) -> Delivery:
-    """读交付目录并与 pipeline 的 manifest.json 逐项对齐。"""
+                     allow_closure_mismatch: bool = False,
+                     allow_stop_reasons=()) -> Delivery:
+    """读交付目录并与 manifest.json 逐项对齐。
+
+    既吃单机 ``corpus_pipeline.py`` 的产物，也吃**多机合并后的交付目录**：
+    多个 `source_key`、同一源文件的多个 `.part-NNNN`、以及可选的 ``machine`` 来源字段。
+    合并目录最容易出的三种错——分片重名、part 编号断号/重号、totals 与逐片之和对不上——
+    都在这里当场拦下，绝不带着不一致上传。
+    """
     if not root.is_dir():
         raise DeliveryError(f"交付目录不存在：{root}")
     mpath = root / PIPELINE_MANIFEST
@@ -188,8 +284,11 @@ def inspect_delivery(root: Path, allow_lock: bool = False, lock_ttl: int = 300,
         raise DeliveryError(
             "交付目录处于分段暂停态（STOP_REASON=segment_paused）：这不是终态，"
             "先跑完最后一段再打包")
-    if stop not in ("corpus_exhausted", "token_target_reached"):
-        raise DeliveryError(f"STOP_REASON 非终态：{stop!r}（应为 corpus_exhausted / token_target_reached）")
+    allowed_stop = tuple(TERMINAL_STOP_REASONS) + tuple(allow_stop_reasons or ())
+    if stop not in allowed_stop:
+        raise DeliveryError(
+            f"STOP_REASON 非终态：{stop!r}（应为 {' / '.join(TERMINAL_STOP_REASONS)}；"
+            f"合并目录的自定义值用 --allow-stop-reason 显式放行）")
 
     if not allow_lock:
         live, desc = lock_is_fresh(root / "run.lock", lock_ttl)
@@ -231,7 +330,10 @@ def inspect_delivery(root: Path, allow_lock: bool = False, lock_ttl: int = 300,
                 raise DeliveryError(msg + "（确认交付目录没被改过；可用 --allow-count-mismatch 降级为警告）")
             print(f"[warn] {msg}")
         parts.append(Part(source_key=key, part=int(s.get("part") or 1), shard_name=shard_name,
-                          path=path, windows=lines, tokens=int(s.get("tokens") or 0)))
+                          path=path, windows=lines, tokens=int(s.get("tokens") or 0),
+                          machine=_machine_of(s)))
+
+    _check_merge_shape(parts, delivered, manifest)
 
     # 分片集合必须与磁盘完全一致：多出来的 *.jsonl 说明 manifest 过期了
     listed = {p.shard_name for p in parts}
@@ -469,12 +571,14 @@ def pack(delivery: Delivery, staging: Path, level: int, threads: int,
             "bytes_zst": info["bytes_zst"],
             "sha256_raw": info["sha256_raw"],
             "sha256_zst": info["sha256_zst"],
+            "machine": p.machine,
         })
         objects.append(Object(
             name=p.name, path=dst, size=info["bytes_zst"], sha256=info["sha256_zst"],
             content_type="application/zstd", kind="shard",
             metadata={"sha256": info["sha256_zst"], "sha256-raw": info["sha256_raw"],
-                      "source-key": p.source_key, "part": str(p.part)},
+                      "source-key": p.source_key, "part": str(p.part),
+                      "machine": p.machine},
         ))
 
     write_json(staging / PACK_STATE, {
@@ -484,6 +588,14 @@ def pack(delivery: Delivery, staging: Path, level: int, threads: int,
     })
     if reused:
         print(f"[pack] {reused}/{len(delivery.parts)} 片复用，未重压")
+
+    # 合并目录体检（只告警）：不同机器若把同一片交了两遍，字节会完全一样
+    seen = {}
+    for r in part_rows:
+        seen.setdefault(r["sha256_raw"], []).append(r["shard_name"])
+    for sha, names in seen.items():
+        if len(names) > 1:
+            print(f"[warn] 这些分片的未压缩内容完全相同（疑似跨机重复交付）：{names}")
 
     # 逐文件聚合
     files = []
@@ -502,6 +614,7 @@ def pack(delivery: Delivery, staging: Path, level: int, threads: int,
             "sha256_raw": rows[0]["sha256_raw"] if len(rows) == 1 else _join_hashes(rows, "sha256_raw"),
             "sha256_zst": rows[0]["sha256_zst"] if len(rows) == 1 else _join_hashes(rows, "sha256_zst"),
             "sha256_scope": "single-part" if len(rows) == 1 else "aggregate-of-parts",
+            "machines": s.machines,
             "parts": rows,
         })
 
@@ -576,6 +689,15 @@ def _write_docs(packed: Packed, source_url: str) -> None:
             "shard_bytes": packed.config.get("shard_bytes"),
         },
         "totals": dict(packed.totals),
+        "provenance": {
+            "multi_machine": len(packed.delivery.machines) > 1,
+            "machines": packed.delivery.machines,
+            "merged_from": packed.delivery.merged_from,
+            "shards_per_machine": {
+                m: sum(1 for p in packed.delivery.parts if p.machine == m)
+                for m in packed.delivery.machines
+            },
+        },
         "files": packed.files,
         "objects": [{
             "name": o.name, "key": o.key(packed.target_prefix), "kind": o.kind,
@@ -583,6 +705,7 @@ def _write_docs(packed: Packed, source_url: str) -> None:
             "sha256_raw": o.metadata.get("sha256-raw", ""),
             "source_key": o.metadata.get("source-key", ""),
             "part": int(o.metadata.get("part", 0) or 0),
+            "machine": o.metadata.get("machine", ""),
         } for o in packed.objects],
         "readme": {},
         "manifest_self": {
@@ -703,15 +826,37 @@ def _render_readme(packed: Packed, m: dict) -> str:
     add(f"| 分片 | 单源 > `{c.get('shard_bytes')}` 字节切 `<主干>.part-NNNN.jsonl`，"
         "压缩后同名加 `.zst` |")
     add("")
+    machines = m.get("provenance", {}).get("machines") or []
+    has_machine = any(p.get("machine") for f in m["files"] for p in f["parts"])
     add("## 二、文件清单")
     add("")
-    add("| 压缩后对象 | 源对象 | 行数 | token | 未压缩字节 | 压缩字节 | sha256（压缩后） |")
-    add("| --- | --- | ---: | ---: | ---: | ---: | --- |")
+    if has_machine:
+        add("| 压缩后对象 | 源对象 | 行数 | token | 未压缩字节 | 压缩字节 | "
+            "sha256（压缩后） | 来源机 |")
+        add("| --- | --- | ---: | ---: | ---: | ---: | --- | --- |")
+    else:
+        add("| 压缩后对象 | 源对象 | 行数 | token | 未压缩字节 | 压缩字节 | "
+            "sha256（压缩后） |")
+        add("| --- | --- | ---: | ---: | ---: | ---: | --- |")
     for f in m["files"]:
         for p in f["parts"]:
-            add(f"| `{p['name']}` | `{f['source_key']}` | {p['windows']:,} | "
-                f"{p['tokens']:,} | {human_bytes(p['bytes_raw'])} | "
-                f"{human_bytes(p['bytes_zst'])} | `{p['sha256_zst']}` |")
+            row = (f"| `{p['name']}` | `{f['source_key']}` | {p['windows']:,} | "
+                   f"{p['tokens']:,} | {human_bytes(p['bytes_raw'])} | "
+                   f"{human_bytes(p['bytes_zst'])} | `{p['sha256_zst']}` |")
+            if has_machine:
+                row += f" {p.get('machine') or '—'} |"
+            add(row)
+    if has_machine:
+        prov = m.get("provenance", {})
+        add("")
+        add(f"来源：**{len(machines)}** 台机器合并交付"
+            + (f"（`{'`、`'.join(machines)}`）" if machines else "")
+            + "，逐机分片数 "
+            + ("、".join(f"{k} {v} 片" for k, v in (prov.get("shards_per_machine") or {}).items())
+               or "未标注")
+            + "。"
+            "每片来自哪台机同时写在 `x-amz-meta-machine` 与清单 `objects[].machine` 里，"
+            "逐文件汇总见 `files[].machines`。")
     add("")
     if any(f.get("sha256_scope") == "aggregate-of-parts" for f in m["files"]):
         add("> 单源多片时，`delivery-manifest.json` 里该文件行的 `sha256_raw` / `sha256_zst` "
@@ -1189,6 +1334,10 @@ def print_plan(delivery: Delivery, args, staging: Path) -> None:
           f"{delivery.tokens:,} token")
     print(f"文件        : {len(delivery.sources)} 个源文件 → {len(delivery.parts)} 个分片 "
           f"→ 同名加 .zst")
+    if delivery.machines:
+        per = {m: sum(1 for p in delivery.parts if p.machine == m) for m in delivery.machines}
+        print(f"合并来源    : {len(delivery.machines)} 台机 {delivery.machines} / 逐机分片 "
+              f"{per}" + (f" / merged_from={delivery.merged_from}" if delivery.merged_from else ""))
     print(f"未压缩合计  : {human_bytes(sum(p.path.stat().st_size for p in delivery.parts))} "
           f"（压缩后未估算，执行时记录）")
     print(f"上传目标    : {target_candidate}（--execute 时才检查是否被占用；"
@@ -1232,6 +1381,8 @@ def build_parser(argv=None):
                     help="分片行数与 manifest 不符时只警告（默认硬失败）")
     ap.add_argument("--allow-closure-mismatch", action="store_true",
                     help="账本不闭合时只警告（默认硬失败）")
+    ap.add_argument("--allow-stop-reason", action="append", default=[], metavar="REASON",
+                    help="额外放行的 STOP_REASON（合并目录自定义终态用，可重复）")
     ap.add_argument("--allow-extra-objects", action="store_true",
                     help="目标目录里有 manifest 之外的对象时只警告（默认视为不一致并失败）")
     ap.add_argument("--force-pack", action="store_true", help="忽略压缩缓存，全部重压")
@@ -1256,7 +1407,8 @@ def main(argv=None) -> int:
         delivery = inspect_delivery(
             root, allow_lock=args.ignore_lock, lock_ttl=args.lock_ttl,
             allow_count_mismatch=args.allow_count_mismatch,
-            allow_closure_mismatch=args.allow_closure_mismatch)
+            allow_closure_mismatch=args.allow_closure_mismatch,
+            allow_stop_reasons=tuple(args.allow_stop_reason or ()))
     except DeliveryError as e:
         print(f"[error] {e}", file=sys.stderr)
         return 2

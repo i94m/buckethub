@@ -283,3 +283,226 @@ class TestUpload(DeliveryBase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+def build_merged_delivery(tmp: Path, shard_bytes: int = 30000) -> Path:
+    """造一个「多机多片合并后」的交付目录：3 个源 key / 4 个分片 / 2 台机器。
+
+    两台机器各自用真 pipeline 跑出本地交付目录（每机一个 raw 目录），再把分片按
+    ``<machine>/<分片名>`` 放进同一个目录，合并 manifest / ledger / totals。
+    这里只验**打包侧**能不能吃合并目录、合完的数字自不自洽；跨机去重的语义问题
+    由集中 plan→emit 保证（HK 已论证按 key 切机合账本不成立），不在这个夹具里表达。
+    """
+    import corpus_pipeline as cp
+
+    plan = {
+        "machine-a": [("gpt-6-astra-0001-20261001.jsonl", 2, False),
+                      ("gpt-6-astra-0002-20261001.jsonl", 1, False)],
+        "machine-b": [("gpt-6-astra-0003-20261001.jsonl", 1, True)],
+    }
+    runs = {}
+    seq = 500
+    for machine, files in plan.items():
+        raw = tmp / f"raw_{machine}"
+        raw.mkdir(parents=True)
+        for name, n, with_image in files:
+            with open(raw / name, "w", encoding="utf-8") as fh:
+                for _ in range(n):
+                    fh.write(json.dumps(make_record(seq), ensure_ascii=False) + "\n")
+                    seq += 1
+                if with_image:
+                    fh.write(json.dumps(make_record(seq, image=True),
+                                        ensure_ascii=False) + "\n")
+                    seq += 1
+        out = tmp / f"{machine}_out"
+        rc = cp.main(["--local-dir", str(raw), "--execute", "--out-dir", str(out),
+                      "--target-tokens", "1000000000", "--shard-bytes", str(shard_bytes)])
+        assert rc == 0
+        runs[machine] = out
+
+    merged = tmp / "merged"
+    merged.mkdir()
+    shards, delivered = [], {}
+    for machine, out in runs.items():
+        m = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+        (merged / machine).mkdir()
+        for s in m["shards"]:
+            shutil.copy2(out / s["file"], merged / machine / s["file"])
+            shards.append(dict(s, file=f"{machine}/{s['file']}", machine=machine))
+        for f in m["delivered_files"]:
+            row = delivered.setdefault(f["source_key"], {
+                "source_key": f["source_key"], "status": f["status"], "mode": f["mode"],
+                "records": 0, "tokens": 0, "parts": 0, "machines": []})
+            row["records"] += f["records"]
+            row["tokens"] += f["tokens"]
+            row["parts"] += f["parts"]
+            row["machines"].append(machine)
+
+    totals = {
+        "delivered_tokens": sum(int(s["tokens"]) for s in shards),
+        "delivered_samples": sum(int(s["samples"]) for s in shards),
+        "delivered_records": sum(f["records"] for f in delivered.values()),
+        "kept_records": sum(f["records"] for f in delivered.values()),
+        "not_delivered": 0,
+    }
+    ledger_files = {}
+    for key, f in delivered.items():
+        windows = sum(int(s["samples"]) for s in shards if s["source_key"] == key)
+        ledger_files[key] = {
+            "scanned": f["records"], "passed": f["records"],
+            "parse_error": 0, "no_session_id": 0, "no_rs_id": 0,
+            "no_encrypted_content": 0, "too_short": 0, "has_image": 0,
+            "session_removed": 0, "prefix_removed": 0,
+            "delivered_records": f["records"], "delivered_windows": windows,
+            "delivered_tokens": f["tokens"],
+        }
+    base = json.loads((runs["machine-a"] / "manifest.json").read_text(encoding="utf-8"))
+    merged_manifest = {
+        "generated_at": "2026-11-03T22:00:00Z",
+        "STOP_REASON": "merged",
+        "SEGMENT_PAUSED": False,
+        "merged_from": list(runs),
+        "stop_file": None,
+        "target_tokens": base.get("target_tokens"),
+        "shards": shards,
+        "delivered_files": list(delivered.values()),
+        "config": base.get("config") or {},
+        "ledger": {"files": ledger_files, "totals": {}, "filter_closure_ok": True},
+        "dedup_closure_ok": True,
+        **totals,
+    }
+    (merged / "manifest.json").write_text(
+        json.dumps(merged_manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    ledger = {"files": ledger_files, "totals": dict(totals)}
+    (merged / "ledger.json").write_text(
+        json.dumps(ledger, ensure_ascii=False, indent=2), encoding="utf-8")
+    return merged
+
+
+class TestMergedDelivery(unittest.TestCase):
+    """多机多片合并后的交付目录：多源 key、同源多 part、合并 totals。"""
+
+    @classmethod
+    def setUpClass(cls):
+        if not _have("tiktoken"):
+            raise unittest.SkipTest("tiktoken 未安装，跳过")
+        cls._tmp = tempfile.TemporaryDirectory(prefix="delivery_merged_test_")
+        cls.tmp = Path(cls._tmp.name)
+        cls.merged = build_merged_delivery(cls.tmp)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def copy_merged(self, name):
+        dst = self.tmp / name
+        shutil.copytree(self.merged, dst)
+        return dst
+
+    def test_no_longer_a_pipeline_dir_only(self):
+        d = dp.inspect_delivery(self.merged)
+        self.assertEqual(len(d.parts), 4, "合成夹具应是 4 个分片")
+        self.assertEqual(len(d.sources), 3, "3 个源 key")
+        self.assertTrue(any(len(s.parts) > 1 for s in d.sources), "同源多 part")
+        self.assertEqual(d.machines, ["machine-a", "machine-b"])
+        self.assertEqual(d.merged_from, ["machine-a", "machine-b"])
+        self.assertEqual(d.windows, 4)
+        self.assertEqual(d.tokens, sum(p.tokens for p in d.parts))
+
+    def test_pack_merged_manifest_selfconsistent(self):
+        staging = self.tmp / "merged_staging"
+        rc = dp.main([str(self.merged), "--execute", "--phase", "pack",
+                      "--staging-dir", str(staging)])
+        self.assertEqual(rc, 0)
+        m = json.loads((staging / dp.DELIVERY_MANIFEST).read_text(encoding="utf-8"))
+        src = json.loads((self.merged / "manifest.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(m["totals"]["parts"], 4)
+        self.assertEqual(m["totals"]["files"], 3)
+        self.assertEqual(m["totals"]["tokens"], src["delivered_tokens"])
+        self.assertEqual(m["totals"]["windows"], src["delivered_samples"])
+        self.assertEqual(m["totals"]["records"], src["delivered_records"])
+        self.assertEqual(sum(f["tokens"] for f in m["files"]), src["delivered_tokens"])
+        self.assertEqual(sum(len(f["parts"]) for f in m["files"]), 4)
+        self.assertEqual(m["provenance"]["machines"], ["machine-a", "machine-b"])
+        self.assertTrue(m["provenance"]["multi_machine"])
+        self.assertEqual(sum(m["provenance"]["shards_per_machine"].values()), 4)
+
+        for f in m["files"]:
+            self.assertEqual(f["windows"], sum(p["windows"] for p in f["parts"]))
+            self.assertTrue(f["machines"], "逐文件应带来源机")
+        # 同源多片：part 连续 + 聚合哈希可复算
+        multi = next(f for f in m["files"] if len(f["parts"]) > 1)
+        self.assertEqual([p["part"] for p in multi["parts"]], [1, 2])
+        self.assertEqual(multi["sha256_scope"], "aggregate-of-parts")
+        joined = "".join(p["sha256_zst"] for p in multi["parts"])
+        import hashlib
+        self.assertEqual(multi["sha256_zst"],
+                         hashlib.sha256(joined.encode("ascii")).hexdigest())
+
+        # 每个对象：文件名扁平化、字节与两份 sha256 自洽
+        for o in m["objects"]:
+            self.assertNotIn("/", o["name"], "合并目录的子目录不该带进对象名")
+            p = staging / o["name"]
+            self.assertTrue(p.exists())
+            self.assertEqual(p.stat().st_size, o["size"])
+            self.assertEqual(dp.sha256_file(p), o["sha256"])
+            self.assertEqual(dp.decompress_sha256(p), o["sha256_raw"])
+            self.assertIn(o["machine"], ("machine-a", "machine-b"))
+
+        readme = (staging / dp.DELIVERY_README).read_text(encoding="utf-8")
+        for needle in ("A1", "整条记录丢弃", "o200k_base", "encode_ordinary",
+                       "machine-a", "machine-b", "2", "复算"):
+            self.assertIn(needle, readme)
+
+    def test_upload_merged_dir(self):
+        staging = self.tmp / "merged_upload_st"
+        sim = self.tmp / "merged_sim"
+        rc = dp.main([str(self.merged), "--execute", "--simulate-local-s3", str(sim),
+                      "--staging-dir", str(staging), "--date", "2026-11-04"])
+        self.assertEqual(rc, 0)
+        report = json.loads((staging / dp.UPLOAD_REPORT).read_text(encoding="utf-8"))
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["object_count"], {"expected": 6, "remote": 6})
+        self.assertEqual(len(report["readback"]), 3)
+
+    def test_part_number_gap_refused(self):
+        bad = self.copy_merged("merged_gap")
+        m = json.loads((bad / "manifest.json").read_text(encoding="utf-8"))
+        victim = next(s for s in m["shards"] if s["part"] == 2)
+        victim["part"] = 3
+        (bad / "manifest.json").write_text(json.dumps(m), encoding="utf-8")
+        with self.assertRaises(dp.DeliveryError) as ctx:
+            dp.inspect_delivery(bad)
+        self.assertIn("连续", str(ctx.exception))
+
+    def test_duplicate_part_refused(self):
+        bad = self.copy_merged("merged_dup")
+        m = json.loads((bad / "manifest.json").read_text(encoding="utf-8"))
+        dup = dict(next(s for s in m["shards"] if s["part"] == 1))
+        dup["file"] = "machine-b/duplicate-of-part-1.jsonl"
+        shutil.copy2(bad / m["shards"][0]["file"], bad / dup["file"])
+        m["shards"].append(dup)
+        (bad / "manifest.json").write_text(json.dumps(m), encoding="utf-8")
+        with self.assertRaises(dp.DeliveryError) as ctx:
+            dp.inspect_delivery(bad)
+        self.assertIn("同一 part", str(ctx.exception))
+
+    def test_totals_not_recomputed_refused(self):
+        bad = self.copy_merged("merged_totals")
+        m = json.loads((bad / "manifest.json").read_text(encoding="utf-8"))
+        m["delivered_records"] = int(m["delivered_records"]) + 1
+        (bad / "manifest.json").write_text(json.dumps(m), encoding="utf-8")
+        with self.assertRaises(dp.DeliveryError) as ctx:
+            dp.inspect_delivery(bad)
+        self.assertIn("重算", str(ctx.exception))
+
+    def test_unknown_stop_reason_needs_flag(self):
+        bad = self.copy_merged("merged_stop")
+        m = json.loads((bad / "manifest.json").read_text(encoding="utf-8"))
+        m["STOP_REASON"] = "merged_partial_2026"
+        (bad / "manifest.json").write_text(json.dumps(m), encoding="utf-8")
+        with self.assertRaises(dp.DeliveryError):
+            dp.inspect_delivery(bad)
+        d = dp.inspect_delivery(bad, allow_stop_reasons=("merged_partial_2026",))
+        self.assertEqual(len(d.parts), 4)
