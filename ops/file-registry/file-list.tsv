@@ -1,0 +1,31 @@
+rank	key	bytes	owner	local_copy	download_status	index_status	delivery_status
+1	Gpt-2026-10-18/gpt-5.6-sol-0001-20261001.jsonl	27212251649	HK-202.6.205.37	-	in_progress	pending	pending
+2	Gpt-2026-10-18/gpt-5.6-sol-0002-20261001.jsonl	29486204385	HK-202.6.205.37	-	in_progress	pending	pending
+3	Gpt-2026-10-18/gpt-5.6-sol-0003-20261001.jsonl	28319027535	HK-202.6.205.37	-	in_progress	pending	pending
+4	Gpt-2026-10-18/gpt-5.6-sol-0004-20261001.jsonl	26998918090	HK-202.6.205.37	-	in_progress	pending	pending
+5	Gpt-2026-10-18/gpt-5.6-sol-0005-20261001.jsonl	29855828171	HK-202.6.205.37	-	in_progress	pending	pending
+6	Gpt-2026-10-18/gpt-5.6-sol-0006-20261001.jsonl	27713997829	HK-202.6.205.37	-	in_progress	pending	pending
+7	Gpt-2026-10-18/gpt-5.6-sol-0007-20261001.jsonl	27770334384	HK-202.6.205.37	-	in_progress	pending	pending
+8	Gpt-2026-10-18/gpt-5.6-sol-0008-20261001.jsonl	28901068047	Mac Mini M4	-	in_progress	pending	pending
+9	Gpt-2026-10-18/gpt-5.6-sol-0009-20261001.jsonl	25449636664	Mac Mini M4	-	in_progress	pending	pending
+10	Gpt-2026-10-18/gpt-5.6-sol-0010-20261001.jsonl	22773244207	Mac Mini M4	-	in_progress	pending	pending
+11	Gpt-2026-10-18/gpt-6-astra-0001-20261001.jsonl	27731823034	Mac Mini M4	-	in_progress	pending	pending
+12	Gpt-2026-10-18/gpt-6-astra-0002-20261001.jsonl	29717778733	Mac Mini M4	-	in_progress	pending	pending
+13	Gpt-2026-10-18/gpt-6-astra-0003-20261001.jsonl	29083432921	Mac Mini M4	-	in_progress	pending	pending
+14	Gpt-2026-10-18/gpt-6-astra-0004-20261001.jsonl	28769896007	Mac Mini M4	-	in_progress	pending	pending
+15	Gpt-2026-10-18/gpt-6-astra-0005-20261001.jsonl	28952405335	Macbook Pro	-	in_progress	pending	pending
+16	Gpt-2026-10-18/gpt-6-astra-0006-20261001.jsonl	26818530282	Macbook Pro	-	in_progress	pending	pending
+17	Gpt-2026-10-18/gpt-6-astra-0007-20261001.jsonl	27788481851	Macbook Pro	-	in_progress	pending	pending
+18	Gpt-2026-10-18/gpt-6-astra-0008-20261001.jsonl	24802964716	Macbook Pro	-	in_progress	pending	pending
+19	Gpt-2026-10-18/gpt-6-astra-0009-20261001.jsonl	9781294415	Macbook Pro	-	in_progress	pending	pending
+20	Gpt-2026-10-18/gpt-6-sol-0001-20261001.jsonl	25102877975	Macbook Pro	-	in_progress	pending	pending
+21	Gpt-2026-10-18/gpt-6-sol-0002-20261001.jsonl	27060435094	Macbook Pro	-	in_progress	pending	pending
+22	Gpt-2026-10-18/gpt-6-sol-0003-20261001.jsonl	26595561759	Macbook Pro	-	in_progress	pending	pending
+23	Gpt-2026-10-18/gpt-6-sol-0004-20261001.jsonl	25825295428	Alienware	/data/corpus-mirror/Gpt-2026-10-18/gpt-6-sol-0004-20261001.jsonl	pending	-	pending
+24	Gpt-2026-10-18/gpt-6-sol-0005-20261001.jsonl	28045084748	Alienware	/data/corpus-mirror/Gpt-2026-10-18/gpt-6-sol-0005-20261001.jsonl	pending	-	pending
+25	Gpt-2026-10-18/gpt-6-sol-0006-20261001.jsonl	28644648289	Alienware	/data/corpus-mirror/Gpt-2026-10-18/gpt-6-sol-0006-20261001.jsonl	pending	-	pending
+26	Gpt-2026-10-18/gpt-6-sol-0007-20261001.jsonl	25933986099	Alienware	/data/corpus-mirror/Gpt-2026-10-18/gpt-6-sol-0007-20261001.jsonl	pending	-	pending
+27	Gpt-2026-10-18/gpt-6-sol-0008-20261001.jsonl	26725316927	Alienware	/data/corpus-mirror/Gpt-2026-10-18/gpt-6-sol-0008-20261001.jsonl	pending	-	pending
+28	Gpt-2026-10-18/gpt-6-sol-0009-20261001.jsonl	26657353494	Alienware	/data/corpus-mirror/Gpt-2026-10-18/gpt-6-sol-0009-20261001.jsonl	pending	-	pending
+29	Gpt-2026-10-18/gpt-6-sol-0010-20261001.jsonl	25142994017	Alienware	/data/corpus-mirror/Gpt-2026-10-18/gpt-6-sol-0010-20261001.jsonl	pending	-	pending
+30	Gpt-2026-10-18/gpt-6-sol-0011-20261001.jsonl	17369019736	Alienware	/data/corpus-mirror/Gpt-2026-10-18/gpt-6-sol-0011-20261001.jsonl	pending	-	pending
