@@ -18,14 +18,14 @@ rank	key	bytes	owner	local_copy	download_status	index_status	delivery_status
 17	Gpt-2026-10-18/gpt-6-astra-0007-20261001.jsonl	27788481851	Mac Mini M4	-	in_progress	pending	pending
 18	Gpt-2026-10-18/gpt-6-astra-0008-20261001.jsonl	24802964716	RT	-	in_progress	pending	pending
 19	Gpt-2026-10-18/gpt-6-astra-0009-20261001.jsonl	9781294415	T14	-	done	done	delivered
-20	Gpt-2026-10-18/gpt-6-sol-0001-20261001.jsonl	25102877975	Alienware	/data/corpus-mirror/Gpt-2026-10-18/gpt-6-sol-0001-20261001.jsonl	done	done	verify_red
+20	Gpt-2026-10-18/gpt-6-sol-0001-20261001.jsonl	25102877975	Alienware	/data/corpus-mirror/Gpt-2026-10-18/gpt-6-sol-0001-20261001.jsonl	done	done	delivered
 21	Gpt-2026-10-18/gpt-6-sol-0002-20261001.jsonl	27060435094	Alienware	/data/corpus-mirror/Gpt-2026-10-18/gpt-6-sol-0002-20261001.jsonl	pending	-	pending
 22	Gpt-2026-10-18/gpt-6-sol-0003-20261001.jsonl	26595561759	Alienware	/data/corpus-mirror/Gpt-2026-10-18/gpt-6-sol-0003-20261001.jsonl	downloading	-	pending
 23	Gpt-2026-10-18/gpt-6-sol-0004-20261001.jsonl	25825295428	Alienware	/data/corpus-mirror/Gpt-2026-10-18/gpt-6-sol-0004-20261001.jsonl	done	done	delivered
 24	Gpt-2026-10-18/gpt-6-sol-0005-20261001.jsonl	28045084748	Alienware	/data/corpus-mirror/Gpt-2026-10-18/gpt-6-sol-0005-20261001.jsonl	done	done	delivered
 25	Gpt-2026-10-18/gpt-6-sol-0006-20261001.jsonl	28644648289	Alienware	/data/corpus-mirror/Gpt-2026-10-18/gpt-6-sol-0006-20261001.jsonl	done	done	delivered
 26	Gpt-2026-10-18/gpt-6-sol-0007-20261001.jsonl	25933986099	Alienware	/data/corpus-mirror/Gpt-2026-10-18/gpt-6-sol-0007-20261001.jsonl	done	done	delivered
-27	Gpt-2026-10-18/gpt-6-sol-0008-20261001.jsonl	26725316927	Alienware	/data/corpus-mirror/Gpt-2026-10-18/gpt-6-sol-0008-20261001.jsonl	done	done	verify_red
-28	Gpt-2026-10-18/gpt-6-sol-0009-20261001.jsonl	26657353494	Alienware	/data/corpus-mirror/Gpt-2026-10-18/gpt-6-sol-0009-20261001.jsonl	done	done	verify_red
+27	Gpt-2026-10-18/gpt-6-sol-0008-20261001.jsonl	26725316927	Alienware	/data/corpus-mirror/Gpt-2026-10-18/gpt-6-sol-0008-20261001.jsonl	done	done	delivered
+28	Gpt-2026-10-18/gpt-6-sol-0009-20261001.jsonl	26657353494	Alienware	/data/corpus-mirror/Gpt-2026-10-18/gpt-6-sol-0009-20261001.jsonl	done	done	delivered
 29	Gpt-2026-10-18/gpt-6-sol-0010-20261001.jsonl	25142994017	Alienware	/data/corpus-mirror/Gpt-2026-10-18/gpt-6-sol-0010-20261001.jsonl	done	done	delivered
 30	Gpt-2026-10-18/gpt-6-sol-0011-20261001.jsonl	17369019736	Alienware	/data/corpus-mirror/Gpt-2026-10-18/gpt-6-sol-0011-20261001.jsonl	done	done	delivered
