@@ -172,3 +172,59 @@ class TestReadResume(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _Budget:
+    def expired(self):
+        return False
+
+
+class TestTallyCompleteness(unittest.TestCase):
+    """断流续跑后「计数」也不能丢：scanned == 各过滤之和 + passed，且 passed == index 行数。
+
+    HK 实测 sol-0005/0006/0007 出现 passed 比 index 行少 409/176/316——行落盘了、tally 没记上。
+    这个用例把「中途断流 → 续跑完成」整条链路跑一遍，断言两个恒等式都成立。
+    """
+
+    def _payload(self):
+        import json as _json
+
+        def rec(i, *, rs=True, enc=True, n=100):
+            msgs = [{"role": "user" if k % 2 == 0 else "assistant",
+                     "content": ([{"type": "text", "text": f"t{i}-{k}"}]
+                                 + ([{"type": "encrypted_content", "encrypted_content": f"e{i}-{k}"}] if enc else []))}
+                    for k in range(n)]
+            out = [{"id": f"rs_{i:03d}"}] if rs else [{"id": "not_rs"}]
+            return {"session_id": f"uuid-{i:03d}~p", "request": {"messages": msgs},
+                    "response": {"response_data": {"output": out}}}
+
+        rows = [rec(0), rec(1), rec(2, rs=False), rec(3, enc=False), rec(4, n=40), rec(5), rec(6)]
+        return b"".join((__import__("json").dumps(r, ensure_ascii=False) + "\n").encode() for r in rows), rows
+
+    def test_counts_survive_a_cut(self):
+        import json as _json
+
+        payload, rows = self._payload()
+        starts = []
+        off = 0
+        for r in rows:
+            starts.append(off)
+            off += len(_json.dumps(r, ensure_ascii=False).encode()) + 1
+
+        client = _FakeS3(payload, cuts=[starts[4] + 7])     # 断在第 5 条中间
+        args = SimpleNamespace(bucket="b", local_dir=None, max_records=0, min_messages=100)
+        res = cp._scan_file(args, client, "k.jsonl", 0, 7, _Budget())
+
+        filters = sum(res["reasons"].values())
+        self.assertEqual(res["scanned"], filters + res["passed"],
+                         f"scanned {res['scanned']} != filters {filters} + passed {res['passed']}")
+        self.assertEqual(res["passed"], len(res["items"]),
+                         f"passed {res['passed']} != items {len(res['items'])}")
+        # 期望：7 条里 0/1/5/6 通过（2 无 rs_id、3 无密文、4 太短）
+        self.assertEqual(res["passed"], 4)
+        self.assertEqual(res["scanned"], 7)
+        self.assertEqual(res["eof"], True)
+        self.assertEqual(res["next_offset"], len(payload))
+        # index 行 = 一条一个 (id, off)，不重复不遗漏
+        ids = [it["id"] for it in res["items"]]
+        self.assertEqual(len(ids), len(set(ids)))
