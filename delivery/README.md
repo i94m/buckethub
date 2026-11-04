@@ -106,7 +106,26 @@ python delivery/delivery_pack.py <OUT>/full --execute --date 2026-11-04
 - **停因**：默认接受 `corpus_exhausted` / `token_target_reached` / `merged`；
   合并层若用别的终态名，用 `--allow-stop-reason <REASON>` 显式放行。
 
-## 五、上传后校验
+## 五、滚动上传（`--rolling`）
+
+同一个日期目录分多轮上传（每跑完一个 key 就追加一批）：
+
+```bash
+python delivery/delivery_pack.py <OUT> --execute --date 2026-11-04 --rolling
+```
+
+规则（全部由代码强制，不靠自律）：
+
+| 对象 | 行为 |
+| --- | --- |
+| 分片 `*.jsonl.zst` | **只追加，永不覆盖**；同名不同 sha256 仍然整批停（退出码 3） |
+| `delivery-manifest.json` / `README.md` | 允许整份替换，**但仅当上一轮清单里的对象集合 ⊆ 本轮**（且每个对象 sha256/字节数没变）；否则整批停 |
+| `manifests/<utc>-<sha12>.json` | 替换前把旧清单原样快照到桶上，可回溯每一轮的清单 |
+| 对象数核对 | 交付对象数 == 桶内对象数（`manifests/` 快照不计入） |
+
+其它不变：`head_object` 核 `ContentLength` + `sha256` 元数据、最大分片与两个文档全文回读、同一目录续跑沿用上次目标、自己写了一半的对象可重传。`--rolling` 只是把「清单/README 可替换」这条口子打开，分片的不可变契约一字未放宽。
+
+## 六、上传后校验
 
 1. 每个对象上传后立刻 `head_object`：`ContentLength` == 本地字节数，且
    `x-amz-meta-sha256` == 本地压缩后 sha256（不符 → 退出码 4）。
@@ -115,7 +134,7 @@ python delivery/delivery_pack.py <OUT>/full --execute --date 2026-11-04
    也全文回读比对。
 4. 结果写 `upload-report.json`；命令行打印「上传 N / 重传 N / 跳过 N / 回读 N 一致」。
 
-## 六、退出码
+## 七、退出码
 
 | 码 | 含义 |
 | --- | --- |
@@ -125,7 +144,7 @@ python delivery/delivery_pack.py <OUT>/full --execute --date 2026-11-04
 | 4 | 上传后校验失败（大小、元数据、对象集合、回读 sha256） |
 | 137 | 自测注入中断（`--simulate-fail-after`） |
 
-## 七、前置校验（不通过直接退出码 2）
+## 八、前置校验（不通过直接退出码 2）
 
 - `manifest.json` 存在且 `STOP_REASON ∈ {corpus_exhausted, token_target_reached}`；
   `segment_paused` 明确拒绝（那是分段中间态，不是终态）。
@@ -136,10 +155,10 @@ python delivery/delivery_pack.py <OUT>/full --execute --date 2026-11-04
 - 分片 token 之和 == `manifest.delivered_tokens`；逐文件与 `ledger.json` 的
   `delivered_windows` / `delivered_tokens` 对得上。
 
-## 八、自测（离线，不需要凭证）
+## 九、自测（离线，不需要凭证）
 
 ```bash
-python -m unittest discover -s delivery/tests -v     # 20 例
+python -m unittest discover -s delivery/tests -v     # 22 例
 ```
 
 合成交付目录由 `pipeline/corpus_pipeline.py --local-dir` 真跑产生（不是手写 manifest），
@@ -148,12 +167,14 @@ python -m unittest discover -s delivery/tests -v     # 20 例
 上传路径用 `--simulate-local-s3 <dir>`（本地假 S3，不联网）；
 `--simulate-fail-after N` 模拟第 N 个 put 时进程被杀。
 
+滚动上传另有一组用例：两轮（第二轮多一个 key）→ 不加 `--rolling` 必须整批停、加了则追加分片+替换文档+留快照、第三轮全跳过、用「少一个 key 的旧目录」回滚必须停。
+
 另有一组**合并目录**用例：两台"机器"各自真跑一遍 pipeline，再按
 `<machine>/<分片>` 合成 3 源 key / 4 分片 / 2 机的合并目录，验 dry-run、
 清单自洽（合并 totals、同源多片的聚合 sha256）、上传校验，以及断号/重号/
 totals 没重算三种合并事故都会被拦下。
 
-## 九、磁盘与耗时预算
+## 十、磁盘与耗时预算
 
 - 额外磁盘 ≈ 压缩后体积（JSONL 文本 zstd level 10 约 1/8~1/12），默认就写在交付目录的
   `_delivery_pack/` 下；磁盘紧就用 `--staging-dir` 指到别处。

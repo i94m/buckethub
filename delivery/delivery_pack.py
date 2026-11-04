@@ -30,6 +30,7 @@ PACK_STATE = "pack-state.json"
 UPLOAD_JOURNAL = "upload.journal.jsonl"
 UPLOAD_REPORT = "upload-report.json"
 DELIVERY_MANIFEST = "delivery-manifest.json"
+SNAPSHOT_DIR = "manifests"
 DELIVERY_README = "README.md"
 PIPELINE_MANIFEST = "manifest.json"
 PIPELINE_LEDGER = "ledger.json"
@@ -976,6 +977,9 @@ class S3Transport:
         h = self.head(key)
         return {"etag": (h or {}).get("etag", "")}
 
+    def read_bytes(self, key: str) -> bytes:
+        return self.client.get_object(Bucket=self.bucket, Key=key)["Body"].read()
+
     def hash_object(self, key: str) -> str:
         h = hashlib.sha256()
         body = self.client.get_object(Bucket=self.bucket, Key=key)["Body"]
@@ -1052,6 +1056,9 @@ class LocalTransport:
                         "content_type": content_type, "at": now_iso()})
         self.puts += 1
         return {"etag": "sim"}
+
+    def read_bytes(self, key: str) -> bytes:
+        return self._obj(key).read_bytes()
 
     def hash_object(self, key: str) -> str:
         return sha256_file(self._obj(key))
@@ -1151,6 +1158,57 @@ def _classify(remote, obj: Object, journal_row, allow_repair: bool) -> str:
     return "conflict"
 
 
+def load_prev_manifest(transport, target: str):
+    """读桶上已有的 delivery-manifest.json（rolling 的「上一轮」）。没有就返回 (None, None)。"""
+    key = target + DELIVERY_MANIFEST
+    if transport.head(key) is None:
+        return None, None
+    raw = transport.read_bytes(key)
+    try:
+        return json.loads(raw), raw
+    except ValueError:
+        raise DeliveryError(f"远端 {key} 不是合法 JSON，无法做 rolling 的「只追加」校验")
+
+
+def prev_subset_ok(prev_manifest: dict, plan: list, target: str) -> tuple:
+    """上一轮清单里的对象必须全部出现在本轮计划里，且 sha256/字节数不变。
+
+    rolling 只允许**追加分片**，不允许删、不允许改（分片不可变）。
+    """
+    current = {o.name: (o.sha256, o.size) for o in plan}
+    problems = []
+    for row in prev_manifest.get("objects") or []:
+        name = row.get("name")
+        if not name:
+            problems.append("上一轮清单里有缺 name 的对象")
+            continue
+        if name not in current:
+            problems.append(f"上一轮的 {name} 不在本轮计划里（rolling 只能追加，不能删）")
+        elif current[name] != (row.get("sha256"), row.get("size")):
+            problems.append(f"{name} 内容与本轮不同（分片不可变）")
+    return (not problems), problems
+
+
+def snapshot_prev_manifest(transport, target: str, staging: Path):
+    """把桶上即将被替换的旧清单原样存到 manifests/<utc>-<sha12>.json。"""
+    key = target + DELIVERY_MANIFEST
+    if transport.head(key) is None:
+        return None
+    raw = transport.read_bytes(key)
+    sha = hashlib.sha256(raw).hexdigest()
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    name = f"{SNAPSHOT_DIR}/{stamp}-{sha[:12]}.json"
+    dest = staging / SNAPSHOT_DIR / f"{stamp}-{sha[:12]}.json"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    skey = target + name
+    if transport.head(skey) is None:          # 已存在同样快照就不重写
+        dest.write_bytes(raw)
+        transport.put_file(skey, dest,
+                           {"sha256": sha, "kind": "manifest-snapshot"}, "application/json")
+        print(f"[rolling] 旧清单已快照 → {skey}")
+    return skey
+
+
 def upload(packed: Packed, transport, args, put: bool = True) -> dict:
     staging = packed.staging
     target = packed.target_prefix
@@ -1161,19 +1219,36 @@ def upload(packed: Packed, transport, args, put: bool = True) -> dict:
     heads = {o.key(target): transport.head(o.key(target))
              for o in plan if o.key(target) in remote}
 
+    rolling = bool(getattr(args, "rolling", False))
     decisions = []
     conflicts = []
     expected_keys = {o.key(target) for o in plan}
+    snap_prefix = target + SNAPSHOT_DIR + "/"
+    subset_ok, subset_problems = True, []
+    if rolling and remote:
+        prev_manifest, _prev_raw = load_prev_manifest(transport, target)
+        if prev_manifest is not None:
+            subset_ok, subset_problems = prev_subset_ok(prev_manifest, plan, target)
+
     if remote and not args.allow_extra_objects:
         for k in sorted(set(remote) - expected_keys):
+            if rolling and k.startswith(snap_prefix):
+                continue        # rolling 的历史清单快照是有意留下的
             conflicts.append({
                 "key": k,
                 "reason": "目标目录里已有非本次交付的对象（本工具只写全新目录，绝不覆盖；"
                           "换 --new-target，或确认后加 --allow-extra-objects）"})
+    if rolling and not subset_ok:
+        conflicts.append({
+            "key": target + DELIVERY_MANIFEST,
+            "reason": "rolling 只允许追加：" + "；".join(subset_problems[:5])})
+
     for obj in plan:
         key = obj.key(target)
         row = journal["objects"].get(key)
         decision = _classify(heads.get(key), obj, row, allow_repair=not args.no_repair)
+        if decision == "conflict" and rolling and subset_ok and obj.kind == "doc":
+            decision = "replace"       # 只有清单/README 允许整体替换
         if decision == "conflict":
             r = heads.get(key) or {}
             reasons = []
@@ -1197,7 +1272,7 @@ def upload(packed: Packed, transport, args, put: bool = True) -> dict:
 
     if not put:
         readbacks = verify_remote(packed, transport, target,
-                                  allow_extra=args.allow_extra_objects)
+                                  allow_extra=args.allow_extra_objects, rolling=rolling)
         report = {
             "schema": SCHEMA, "generated_at": now_iso(),
             "delivery_id": packed.delivery_id, "bucket": transport.bucket,
@@ -1215,7 +1290,7 @@ def upload(packed: Packed, transport, args, put: bool = True) -> dict:
     order = {o.name: i for i, o in enumerate(packed.objects)}
     ordered = sorted(decisions, key=lambda t: (t[0].kind != "shard", order.get(t[0].name, 999)))
 
-    done, repaired, skipped = [], [], []
+    done, repaired, skipped, snapshots, replaced = [], [], [], [], []
     for obj, key, decision in ordered:
         if decision == "skip":
             skipped.append(key)
@@ -1231,10 +1306,15 @@ def upload(packed: Packed, transport, args, put: bool = True) -> dict:
                 continue
             decision = "repair"
 
+        if decision == "replace" and obj.name == DELIVERY_MANIFEST:
+            snap = snapshot_prev_manifest(transport, target, staging)
+            if snap:
+                snapshots.append(snap)
+
         _append_journal(staging, "start", key=key, sha256=obj.sha256, size=obj.size,
                         delivery_id=obj.metadata.get("delivery-id"))
-        print(f"[upload] {'重传半截对象' if decision == 'repair' else '上传'} {key} "
-              f"({human_bytes(obj.size)})")
+        label = {"repair": "重传半截对象", "replace": "替换文档（rolling）"}.get(decision, "上传")
+        print(f"[upload] {label} {key} ({human_bytes(obj.size)})")
         transport.put_file(key, obj.path, obj.metadata, obj.content_type)
 
         h = transport.head(key)
@@ -1244,13 +1324,17 @@ def upload(packed: Packed, transport, args, put: bool = True) -> dict:
             raise VerifyError(f"ContentLength 不符：{key} 远端 {h['size']} ≠ 本地 {obj.size}")
         if (h.get("metadata") or {}).get("sha256") != obj.sha256:
             raise VerifyError(f"对象元数据 sha256 不符：{key}")
-        _append_journal(staging, "repaired" if decision == "repair" else "put",
+        _append_journal(staging,
+                        {"repair": "repaired", "replace": "replaced"}.get(decision, "put"),
                         key=key, sha256=obj.sha256, size=obj.size, etag=h.get("etag"))
-        (repaired if decision == "repair" else done).append(key)
+        if decision == "replace":
+            replaced.append(key)
+        else:
+            (repaired if decision == "repair" else done).append(key)
 
     # 对象集合必须与 manifest 完全一致 + 回读抽检
     readbacks = verify_remote(packed, transport, target,
-                              allow_extra=args.allow_extra_objects)
+                              allow_extra=args.allow_extra_objects, rolling=rolling)
 
     report = {
         "schema": SCHEMA,
@@ -1262,6 +1346,9 @@ def upload(packed: Packed, transport, args, put: bool = True) -> dict:
                          "remote": len(transport.list_prefix(target))},
         "uploaded": done,
         "repaired": repaired,
+        "replaced": replaced,
+        "snapshots": snapshots,
+        "rolling": rolling,
         "skipped": skipped,
         "readback": readbacks,
         "totals": packed.totals,
@@ -1273,12 +1360,20 @@ def upload(packed: Packed, transport, args, put: bool = True) -> dict:
     return report
 
 
-def verify_remote(packed: Packed, transport, target: str, allow_extra: bool = False) -> list:
-    """对象集合逐一对齐 + 每个对象 head 核大小/元数据 + 最大分片与文档全文回读。"""
+def verify_remote(packed: Packed, transport, target: str, allow_extra: bool = False,
+                  rolling: bool = False) -> list:
+    """对象集合逐一对齐 + 每个对象 head 核大小/元数据 + 最大分片与文档全文回读。
+
+    rolling 模式下，`<target>manifests/` 下的历史清单快照不算"多余对象"
+    （它们是有意保留的可回溯副本）。
+    """
     plan = packed.all_objects()
     remote = transport.list_prefix(target)
     expected = {o.key(target) for o in plan}
     got = set(remote)
+    if rolling:
+        snap_prefix = target + SNAPSHOT_DIR + "/"
+        got = {k for k in got if not k.startswith(snap_prefix)}
     missing = sorted(expected - got)
     extra = sorted(got - expected)
     if missing or (extra and not allow_extra):
@@ -1348,6 +1443,9 @@ def print_plan(delivery: Delivery, args, staging: Path) -> None:
           "最大分片与两个文档全文回读比对；桶内对象集合与 manifest 完全一致")
     print("幂等        : 同名 + 同 sha256 → 跳过；同名 + 不同 sha256 → 整批停（退出码 3）；"
           "上次自己写了一半的对象 → 重传")
+    if getattr(args, "rolling", False):
+        print("滚动上传    : 开启（分片只追加；manifest/README 可在「上一轮对象集 ⊆ 本轮」时替换，"
+              "旧清单存 manifests/ 快照）")
     print("")
     print("执行方式（T14 收尾时原样跑；凭证先 export 到环境变量）：")
     print("  export B2_KEY_ID=… B2_APP_KEY=…")
@@ -1375,6 +1473,9 @@ def build_parser(argv=None):
     ap.add_argument("--date", default=None, help="日期目录名（默认今天 UTC，形如 2026-11-04）")
     ap.add_argument("--target-prefix", default=None, help="显式指定完整目标前缀（调试/续跑用）")
     ap.add_argument("--new-target", action="store_true", help="忽略上次记录，重新挑一个全新日期目录")
+    ap.add_argument("--rolling", action="store_true",
+                    help="滚动上传：同一日期目录多轮追加分片；只有 manifest/README 可替换"
+                         "（且上一轮对象集必须是本轮子集），旧清单留 manifests/ 快照")
     ap.add_argument("--no-repair", action="store_true",
                     help="连自己上次写了一半的对象也不重传（遇到就整批停）")
     ap.add_argument("--allow-count-mismatch", action="store_true",

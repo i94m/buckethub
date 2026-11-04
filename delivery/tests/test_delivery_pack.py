@@ -506,3 +506,111 @@ class TestMergedDelivery(unittest.TestCase):
             dp.inspect_delivery(bad)
         d = dp.inspect_delivery(bad, allow_stop_reasons=("merged_partial_2026",))
         self.assertEqual(len(d.parts), 4)
+
+
+def _extend_raw(src_raw: Path, dst_raw: Path, extra_names) -> None:
+    """把一轮的 raw 复制一份，再补几个新源文件（模拟"又跑完一个 key"）。"""
+    dst_raw.mkdir(parents=True)
+    for p in sorted(src_raw.glob("*.jsonl")):
+        shutil.copy2(p, dst_raw / p.name)
+    seq = 900
+    for name in extra_names:
+        with open(dst_raw / name, "w", encoding="utf-8") as fh:
+            for _ in range(2):
+                fh.write(json.dumps(make_record(seq), ensure_ascii=False) + "\n")
+                seq += 1
+
+
+class TestRolling(unittest.TestCase):
+    """rolling：同一日期目录多轮追加；分片不可变；manifest/README 可替换并留快照。"""
+
+    @classmethod
+    def setUpClass(cls):
+        if not _have("tiktoken"):
+            raise unittest.SkipTest("tiktoken 未安装，跳过")
+        import corpus_pipeline as cp
+
+        cls._tmp = tempfile.TemporaryDirectory(prefix="delivery_rolling_")
+        cls.tmp = Path(cls._tmp.name)
+        cls.out1 = build_delivery(cls.tmp / "r1")
+
+        raw2 = cls.tmp / "r2" / "raw"
+        _extend_raw(cls.tmp / "r1" / "raw", raw2, ["gpt-6-astra-0007-20261001.jsonl"])
+        cls.out2 = cls.tmp / "r2" / "out"
+        rc = cp.main(["--local-dir", str(raw2), "--execute", "--out-dir", str(cls.out2),
+                      "--target-tokens", "1000000000", "--shard-bytes", "30000"])
+        assert rc == 0
+        cls.sim = cls.tmp / "sim"
+        cls.st1 = cls.tmp / "st1"
+        cls.st2 = cls.tmp / "st2"
+        cls.st3 = cls.tmp / "st3"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def run_pack(self, out, staging, *flags):
+        return dp.main([str(out), "--execute", "--simulate-local-s3", str(self.sim),
+                        "--date", "2026-11-04", "--target-prefix", "2026-11-04/",
+                        "--staging-dir", str(staging)] + list(flags))
+
+    def remote_keys(self):
+        base = self.sim / "objects" / "2026-11-04"
+        return sorted(p.relative_to(base).as_posix() for p in base.rglob("*") if p.is_file())
+
+    def test_rounds(self):
+        # 第 1 轮
+        self.assertEqual(self.run_pack(self.out1, self.st1), 0)
+        keys1 = self.remote_keys()
+        self.assertIn("delivery-manifest.json", keys1)
+
+        # 第 2 轮不写 --rolling：必须整批停（旧行为不变）
+        self.assertEqual(self.run_pack(self.out2, self.st2), 3)
+        self.assertEqual(self.remote_keys(), keys1, "冲突时一个字节都不该写")
+
+        # 第 2 轮写 --rolling：追加分片 + 替换两个文档 + 留快照
+        self.assertEqual(self.run_pack(self.out2, self.st2, "--rolling"), 0)
+        keys2 = self.remote_keys()
+        snaps = [k for k in keys2 if k.startswith("manifests/")]
+        self.assertEqual(len(snaps), 1, "旧清单应留一份快照")
+        m2 = json.loads((self.sim / "objects" / "2026-11-04" / "delivery-manifest.json").read_text())
+        m1 = json.loads((self.st1 / dp.DELIVERY_MANIFEST).read_text())
+        self.assertGreater(len(m2["files"]), len(m1["files"]), "清单要体现新增文件")
+        self.assertEqual(m2["object_count"], len(m2["objects"]) + 2)
+        report = json.loads((self.st2 / dp.UPLOAD_REPORT).read_text())
+        self.assertTrue(report["rolling"])
+        self.assertEqual(sorted(report["replaced"]),
+                         ["2026-11-04/README.md", "2026-11-04/delivery-manifest.json"])
+        self.assertEqual(len(report["snapshots"]), 1)
+        self.assertEqual(report["object_count"]["expected"], m2["object_count"])
+        self.assertEqual(report["object_count"]["remote"],
+                         m2["object_count"] + 1)  # +1 = manifests/ 快照
+        self.assertEqual(len(keys2), m2["object_count"] + 1)
+
+        # 快照内容 = 第 1 轮清单
+        snap = json.loads((self.sim / "objects" / "2026-11-04" / snaps[0]).read_text())
+        self.assertEqual(snap["delivery_id"], m1["delivery_id"])
+
+        # 第 3 轮：无变化 → 全跳过
+        self.assertEqual(self.run_pack(self.out2, self.st2, "--rolling"), 0)
+        r3 = json.loads((self.st2 / dp.UPLOAD_REPORT).read_text())
+        self.assertEqual(r3["uploaded"], [])
+        self.assertEqual(r3["replaced"], [])
+        self.assertEqual(len(r3["skipped"]), m2["object_count"])
+
+        # 用旧目录（少一个 key）去 rolling：上一轮对象集不是本轮子集 → 必须停
+        self.assertEqual(self.run_pack(self.out1, self.st3, "--rolling"), 3)
+
+    def test_prev_subset_guard(self):
+        plan = [dp.Object(name="a.jsonl.zst", path=Path("a"), size=10, sha256="s1",
+                          content_type="application/zstd", kind="shard")]
+        ok, why = dp.prev_subset_ok({"objects": [{"name": "a.jsonl.zst", "sha256": "s1",
+                                                 "size": 10}]}, plan, "p/")
+        self.assertTrue(ok, why)
+        ok, why = dp.prev_subset_ok({"objects": [{"name": "gone.jsonl.zst", "sha256": "s1",
+                                                 "size": 10}]}, plan, "p/")
+        self.assertFalse(ok)
+        ok, why = dp.prev_subset_ok({"objects": [{"name": "a.jsonl.zst", "sha256": "different",
+                                                 "size": 10}]}, plan, "p/")
+        self.assertFalse(ok)
+        self.assertIn("不可变", why[0])
