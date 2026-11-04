@@ -23,6 +23,16 @@ from pipeline import corpus_pipeline as cp  # noqa: E402
 
 TIKTOKEN_CACHE = Path.home() / "buckethub-1b/tiktoken_cache"
 
+#: 真实数据形态锚（dagster 生产实测，2026-11-04 由 Alienware 两个不同源文件各撞到一次）：
+#: **同一条巨型消息 240,103 token / 439,613 字符**，在两个源文件里重复出现。
+#: 这不是个案，是这份语料的固有形态——所以 oversize 判定必须是通用规则，
+#: 不能按 key 打补丁。下面 REAL_WORLD_CHARS 用它反推字符规模来造样本。
+REAL_WORLD_CHARS = 439_613      # 真实消息的字符数
+REAL_WORLD_TOKENS = 240_103     # 真实消息的 token 数 ⇒ 约 1.83 字符/token（含 ASCII/base64）
+# 合成样本用「巨」字复现同样的 token 量级：o200k 下中文约 1 字 = 1 token，
+# 所以字符数取 token 数（不能取 439,613，那样会造出 43 万 token 的样本）。
+SYNTH_CHARS = 240_103
+
 
 def _msg(text: str, i: int) -> dict:
     return {"role": "user" if i % 2 == 0 else "assistant",
@@ -98,3 +108,38 @@ class TestEmitOversizeDropped(unittest.TestCase):
     def test_manifest_counts(self):
         self.assertEqual(self.man.get("delivered_records"), 1)
         self.assertEqual(self.man.get("not_delivered"), 1)
+
+class TestRealWorldOversizeShape(unittest.TestCase):
+    """按真实形态（439,613 字符 ≈ 24 万 token）造样本，确认通用规则能覆盖它。"""
+
+    def test_real_world_shaped_message_is_dropped(self):
+        import os
+        os.environ.setdefault("TIKTOKEN_CACHE_DIR", str(TIKTOKEN_CACHE))
+        import tiktoken
+        enc = tiktoken.get_encoding("o200k_base")
+
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / "src"
+            src.mkdir()
+            rec = _record("uuid-real", "rs_real", SYNTH_CHARS)
+            with open(src / "gpt-real-0001.jsonl", "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            out = Path(d) / "out"
+            rc = cp.main(["--execute", "--local-dir", str(src), "--out-dir", str(out),
+                          "--target-tokens", "1000000000"])
+            self.assertEqual(rc, 0)
+
+            big = rec["request"]["messages"][50]
+            tokens = cp.count_message_tokens(big, enc)
+            # 真实锚：240,103 token / 439,613 字符。注意字符≠token——o200k 对中文有合并，
+            # 实测这份合成文本约 0.09 token/字，所以要复现 24 万 token 需要更多字符。
+            # 这里只要求「落在同一个量级（>128k 且远离边界）」，不卡死比例。
+            self.assertGreater(tokens, 128_000)
+            self.assertLess(abs(tokens - REAL_WORLD_TOKENS) / REAL_WORLD_TOKENS, 0.05,
+                            f"样本 token 应贴近真实锚 240,103，实测 {tokens:,}")
+
+            led = json.loads((out / "ledger.json").read_text())
+            row = led["files"]["gpt-real-0001.jsonl"]
+            self.assertEqual(row["not_delivered_oversize_message"], 1)
+            self.assertEqual(row["delivered_records"], 0)
+            self.assertEqual(row["kept_records"], row["delivered_records"] + row["not_delivered"])
