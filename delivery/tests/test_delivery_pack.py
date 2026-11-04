@@ -779,3 +779,43 @@ class TestPerSourceSubdir(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertTrue((self.sim / "objects" / "2026-11-04" / "gpt-6-astra-0002-20261001"
                          / "delivery-manifest.json").exists())
+
+
+class TestRefreshMetadata(unittest.TestCase):
+    """内容相同的对象缺 x-amz-meta-sha256 时，--refresh-metadata 只补元数据。"""
+
+    @classmethod
+    def setUpClass(cls):
+        if not _have("tiktoken"):
+            raise unittest.SkipTest("tiktoken 未安装，跳过")
+        cls._tmp = tempfile.TemporaryDirectory(prefix="delivery_meta_")
+        cls.tmp = Path(cls._tmp.name)
+        cls.out = build_delivery(cls.tmp / "r")
+        cls.sim = cls.tmp / "sim"
+        cls.st = cls.tmp / "st"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def test_refresh(self):
+        args = [str(self.out), "--execute", "--simulate-local-s3", str(self.sim),
+                "--date", "2026-11-04", "--staging-dir", str(self.st)]
+        self.assertEqual(dp.main(args), 0)
+        # 抹掉一个分片的元数据（模拟 upload 端没写）
+        metas = sorted((self.sim / "meta" / "2026-11-04").glob("*.zst.json"))
+        self.assertTrue(metas)
+        victim = metas[0]
+        key = victim.name[:-len(".json")].replace("2026-11-04/", "")
+        victim.unlink()
+        h = dp.LocalTransport(self.sim).head(f"2026-11-04/{key}")
+        self.assertFalse((h.get("metadata") or {}).get("sha256"))
+
+        # 不加 flag：按冲突整批停（保守，不覆盖）
+        self.assertEqual(dp.main(args), 3)
+        h = dp.LocalTransport(self.sim).head(f"2026-11-04/{key}")
+        self.assertFalse((h.get("metadata") or {}).get("sha256"))
+
+        self.assertEqual(dp.main(args + ["--refresh-metadata"]), 0)
+        h = dp.LocalTransport(self.sim).head(f"2026-11-04/{key}")
+        self.assertTrue((h.get("metadata") or {}).get("sha256"))

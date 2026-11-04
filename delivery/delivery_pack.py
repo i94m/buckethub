@@ -1407,6 +1407,9 @@ def upload(packed: Packed, transport, args, put: bool = True) -> dict:
         key = obj.key(target)
         row = journal["objects"].get(key)
         decision = _classify(heads.get(key), obj, row, allow_repair=not args.no_repair)
+        if (decision == "conflict" and getattr(args, "refresh_metadata", False)
+                and (heads.get(key) or {}).get("size") == obj.size):
+            decision = "refresh"      # 尺寸一致才进候选，真伪在上传前用全文回读判定
         if decision == "conflict" and rolling and obj.kind in ("doc", "extra"):
             decision = "replace"       # 只有清单/README/随附证据允许整体替换（分片永不可变）
         if decision == "conflict":
@@ -1455,10 +1458,21 @@ def upload(packed: Packed, transport, args, put: bool = True) -> dict:
     done, repaired, skipped, snapshots, replaced = [], [], [], [], []
     for obj, key, decision in ordered:
         if decision == "skip":
-            skipped.append(key)
-            _append_journal(staging, "skip", key=key, sha256=obj.sha256, size=obj.size)
-            print(f"[upload] 跳过（已存在且 sha256 相同）{key}")
-            continue
+            md = ((heads.get(key) or {}).get("metadata") or {})
+            if getattr(args, "refresh_metadata", False) and md.get("sha256") != obj.sha256:
+                decision = "refresh"
+                print(f"[upload] 补元数据（内容未变，只补 x-amz-meta-sha256）{key}")
+            else:
+                skipped.append(key)
+                _append_journal(staging, "skip", key=key, sha256=obj.sha256, size=obj.size)
+                print(f"[upload] 跳过（已存在且 sha256 相同）{key}")
+                continue
+        if decision == "refresh":
+            got = transport.hash_object(key)
+            if got != obj.sha256:
+                raise ConflictError(
+                    f"拒绝补元数据：{key} 远端内容 sha256={got} ≠ 本地 {obj.sha256}"
+                    "（不是同一个文件，绝不覆盖）")
         if decision == "verify":
             got = transport.hash_object(key)
             if got == obj.sha256:
@@ -1475,7 +1489,8 @@ def upload(packed: Packed, transport, args, put: bool = True) -> dict:
 
         _append_journal(staging, "start", key=key, sha256=obj.sha256, size=obj.size,
                         delivery_id=obj.metadata.get("delivery-id"))
-        label = {"repair": "重传半截对象", "replace": "替换文档（rolling）"}.get(decision, "上传")
+        label = {"repair": "重传半截对象", "replace": "替换文档（rolling）",
+                 "refresh": "补元数据"}.get(decision, "上传")
         print(f"[upload] {label} {key} ({human_bytes(obj.size)})")
         transport.put_file(key, obj.path, obj.metadata, obj.content_type)
 
@@ -1662,6 +1677,8 @@ def build_parser(argv=None):
                     help="目标目录里有 manifest 之外的对象时只警告（默认视为不一致并失败）")
     ap.add_argument("--include", action="append", default=[], metavar="PATH",
                     help="随交付一起上传的附加文件（如 accept-report.json），可重复")
+    ap.add_argument("--refresh-metadata", action="store_true",
+                    help="内容相同但远端缺 x-amz-meta-sha256 的对象，按原字节重传一次补元数据")
     ap.add_argument("--force-pack", action="store_true", help="忽略压缩缓存，全部重压")
     ap.add_argument("--ignore-lock", action="store_true", help="忽略 run.lock（确认没有实例在跑时用）")
     ap.add_argument("--lock-ttl", type=int, default=300)

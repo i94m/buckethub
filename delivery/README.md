@@ -129,6 +129,11 @@ python delivery/delivery_pack.py <OUT_DIR> --execute \
 买家据此能自己跑 `accept.cli verify` 复算；不需要手工 `--include`。
 多个 key 各写各的前缀，**可以多台并发**，不需要等谁。
 
+### 补元数据（`--refresh-metadata`）
+
+历史对象可能上传时没写 `x-amz-meta-sha256`。加 `--refresh-metadata` 会：**先全文回读确认远端内容 sha256 == 本地**，
+一致才按原字节重传一次补元数据；不一致直接整批停（绝不覆盖）。默认关闭。
+
 ## 六、滚动上传（`--rolling`）
 
 同一个日期目录分多轮上传（每跑完一个 key 就追加一批）：
