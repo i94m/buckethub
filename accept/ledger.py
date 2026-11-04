@@ -55,6 +55,10 @@ STOP_REASON_ALIASES = {
 
 #: 这些字段是汇总值/元数据，不是"某一步移除了多少条"，归类时必须跳过。
 _NON_STEP_FIELDS = {
+    # 裁决 B 的「单条 message 超 128k → 整条不交付」：它已经包含在 not_delivered 里
+    # （kept - delivered），单独一栏只是可解释性计数，**不是**移除步骤，
+    # 也不能落进 filter_min_messages（名字里有 message，会被老规则误判）。
+    "notdeliveredoversizemessage",
     "scanned",
     "rawlines",
     "inputlines",
