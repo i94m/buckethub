@@ -819,3 +819,63 @@ class TestRefreshMetadata(unittest.TestCase):
         self.assertEqual(dp.main(args + ["--refresh-metadata"]), 0)
         h = dp.LocalTransport(self.sim).head(f"2026-11-04/{key}")
         self.assertTrue((h.get("metadata") or {}).get("sha256"))
+
+
+class TestStaleStagingExtras(unittest.TestCase):
+    """暂存里是旧版清单（extras 只有一项）时，滚动合并必须以本轮 extras 为准。
+
+    复现历史 bug：暂存的 delivery-manifest 是上一版工具写的（只有 accept-report），
+    本轮 packed.extras 已有 manifest.json / ledger.json —— 若合并读旧清单，
+    清单写 4 个对象、桶里却是 6 个。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        if not _have("tiktoken"):
+            raise unittest.SkipTest("tiktoken 未安装，跳过")
+        cls._tmp = tempfile.TemporaryDirectory(prefix="delivery_stale_")
+        cls.tmp = Path(cls._tmp.name)
+        cls.out = build_delivery(cls.tmp / "r")
+        cls.sim = cls.tmp / "sim"
+        cls.st = cls.tmp / "st"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def test_stale_staging_manifest(self):
+        transport = dp.LocalTransport(self.sim)
+        args = dp.build_parser().parse_args(
+            [str(self.out), "--execute", "--simulate-local-s3", str(self.sim),
+             "--staging-dir", str(self.st)])
+        args.rolling = True
+        prefix = "2026-11-04/"
+
+        delivery = dp.inspect_delivery(self.out)
+        packed = dp.pack(delivery, self.st, 10, 0, prefix, "s3://x/y")
+        dp.upload(packed, transport, args)
+
+        # 把暂存清单改成旧版：extras 只留 accept-report
+        mpath = self.st / dp.DELIVERY_MANIFEST
+        m = json.loads(mpath.read_text())
+        m["extra_documents"] = [e for e in m["extra_documents"]
+                                if e["name"] == "accept-report.json"]
+        m["object_count"] = len(m["objects"]) + 2 + len(m["extra_documents"])
+        mpath.write_text(json.dumps(m, ensure_ascii=False, indent=2))
+
+        # 本轮重新 pack（extras 3 项），再滚动上传
+        packed2 = dp.pack(delivery, self.st, 10, 0, prefix, "s3://x/y")
+        # 故意把暂存再打回旧版，模拟「旧工具写过、本轮没被重写」的暂存态
+        mpath.write_text(json.dumps(m, ensure_ascii=False, indent=2))
+        report = dp.upload(packed2, transport, args)
+        self.assertTrue(report["ok"])
+        remote = json.loads((self.sim / "objects" / "2026-11-04"
+                             / "delivery-manifest.json").read_text())
+        names = {e["name"] for e in remote["extra_documents"]}
+        self.assertIn("manifest.json", names)
+        self.assertIn("ledger.json", names)
+        self.assertEqual(remote["object_count"], len(remote["objects"]) + 2 + len(names))
+        base = self.sim / "objects" / "2026-11-04"
+        actual = {p.relative_to(base).as_posix() for p in base.rglob("*")
+                  if p.is_file() and not p.relative_to(base).as_posix().startswith("manifests/")}
+        self.assertEqual(len(actual), remote["object_count"])

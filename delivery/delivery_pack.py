@@ -1368,6 +1368,13 @@ def upload(packed: Packed, transport, args, put: bool = True) -> dict:
         prev_manifest, _prev_raw = load_prev_manifest(transport, target)
         if prev_manifest is not None:
             local_manifest = read_json(staging / DELIVERY_MANIFEST)
+            # 暂存里的清单可能是上一版工具写的（extras 少几项）。以本轮 packed.extras 为准，
+            # 否则合并出来的 object_count 会比实际上传的对象少，桶上清单永远对不上。
+            local_manifest["extra_documents"] = [
+                {"name": o.name, "size": o.size, "sha256": o.sha256}
+                for o in packed.extras]
+            local_manifest["object_count"] = (len(local_manifest.get("objects") or [])
+                                              + 2 + len(packed.extras))
             merged = merge_manifests(prev_manifest, local_manifest)
             if not _payload_equal(merged, read_json(staging / DELIVERY_MANIFEST), ()):
                 # 本轮要上传的清单就是合并后的这份（哪怕"没有新增"，也要把上一轮的
