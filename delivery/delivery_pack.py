@@ -191,7 +191,7 @@ class Delivery:
         return [str(x) for x in v] if isinstance(v, list) else [str(v)]
 
 
-TERMINAL_STOP_REASONS = ("corpus_exhausted", "token_target_reached", "merged")
+TERMINAL_STOP_REASONS = ("corpus_exhausted", "token_target_reached", "source_exhausted", "merged")
 
 
 def _machine_of(row: dict) -> str:
