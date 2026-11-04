@@ -158,7 +158,7 @@ python delivery/delivery_pack.py <OUT> --execute --date 2026-11-04 --rolling
 ## 九、自测（离线，不需要凭证）
 
 ```bash
-python -m unittest discover -s delivery/tests -v     # 22 例
+python -m unittest discover -s delivery/tests -v     # 23 例
 ```
 
 合成交付目录由 `pipeline/corpus_pipeline.py --local-dir` 真跑产生（不是手写 manifest），

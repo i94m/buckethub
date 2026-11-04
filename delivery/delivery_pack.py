@@ -1130,6 +1130,11 @@ def resolve_target(transport, args, staging: Path, journal: dict) -> str:
         return pinned if pinned.endswith("/") else pinned + "/"
 
     base = args.date or time.strftime("%Y-%m-%d", time.gmtime())
+    if getattr(args, "rolling", False) and not args.new_target:
+        existing = f"{root}{base}/"
+        if transport.head(existing + DELIVERY_MANIFEST) is not None:
+            print(f"[target] rolling：沿用已有交付目录 {existing}")
+            return existing
     candidates = [base] + [f"{base}-delivery-{i}" for i in range(1, 100)]
     for cand in candidates:
         prefix = f"{root}{cand}/"

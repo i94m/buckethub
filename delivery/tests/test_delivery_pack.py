@@ -601,6 +601,19 @@ class TestRolling(unittest.TestCase):
         # 用旧目录（少一个 key）去 rolling：上一轮对象集不是本轮子集 → 必须停
         self.assertEqual(self.run_pack(self.out1, self.st3, "--rolling"), 3)
 
+    def test_rolling_reuses_existing_dir_without_target_prefix(self):
+        # 不显式给 --target-prefix，rolling 也应自动认领已有日期目录，而不是新开 -delivery-1
+        sim = self.tmp / "sim2"
+        st = self.tmp / "st4"
+        base = [str(self.out1), "--execute", "--simulate-local-s3", str(sim),
+                "--date", "2026-11-04", "--staging-dir", str(st)]
+        self.assertEqual(dp.main(base), 0)
+        self.assertEqual(dp.main(base + ["--rolling"]), 0)
+        self.assertEqual(dp.main([str(self.out2)] + base[1:] + ["--rolling"]), 0)
+        report = json.loads((st / dp.UPLOAD_REPORT).read_text())
+        self.assertEqual(report["target_prefix"], "2026-11-04/")
+        self.assertFalse((sim / "objects" / "2026-11-04-delivery-1").exists())
+
     def test_prev_subset_guard(self):
         plan = [dp.Object(name="a.jsonl.zst", path=Path("a"), size=10, sha256="s1",
                           content_type="application/zstd", kind="shard")]
