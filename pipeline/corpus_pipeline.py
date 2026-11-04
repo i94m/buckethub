@@ -933,6 +933,10 @@ def phase_emit(args, state, ledger, out_dir: Path, budget: SegmentBudget):
     done = {e["id"] for e in entries}
     written_tokens = _journal_tokens(entries)
     emit_state = state.data["emit"]
+    # 上一段判定为「单条 message 自身超限、整条不交付」的记录，同样视为已处理（幂等）
+    skipped_oversize = list(emit_state.get("skipped_oversize") or [])
+    skipped_set = set(skipped_oversize)
+    done |= skipped_set
     files_state = emit_state.setdefault("files", {})
     parts = _rebuild_parts(out_dir, entries, files_state)
     client = None if args.local_dir else make_client(args)
@@ -1048,6 +1052,14 @@ def phase_emit(args, state, ledger, out_dir: Path, budget: SegmentBudget):
                     continue
                 msgs = messages_of(rec)
                 windows, window_tokens, oversize = split_windows(msgs, encoder, args.max_sample_tokens)
+                if oversize > 0:
+                    # 整条 message 自身就超过单条上限：切窗无解（切出来的窗口里那条还是超），
+                    # 按裁决 B 整条不交付，账本记 not_delivered_oversize_message。
+                    if it["id"] not in skipped_set:
+                        skipped_set.add(it["id"])
+                        skipped_oversize.append(it["id"])
+                    done.add(it["id"])
+                    continue
 
                 # 整组窗口是最小提交单位：先全部拼好，再决定换不换分片，最后一起落盘 + 一笔入账
                 group = []
@@ -1134,7 +1146,18 @@ def phase_emit(args, state, ledger, out_dir: Path, budget: SegmentBudget):
             seen_records.add(e["id"])
             row["delivered_records"] += 1
 
+    for row in ledger.files.values():
+        row["not_delivered_oversize_message"] = 0
+    for rid in skipped_oversize:
+        key = rid.rsplit("#", 1)[0]
+        if key in ledger.files:
+            ledger.files[key]["not_delivered_oversize_message"] = (
+                ledger.files[key].get("not_delivered_oversize_message", 0) + 1)
+
     finalize_ledger(ledger)
+    emit_state["skipped_oversize"] = skipped_oversize
+    if skipped_oversize:
+        print(f"[emit] 整条不交付（单条 message 自身 > {args.max_sample_tokens:,} token）：{len(skipped_oversize)} 条")
     emit_state.update({"stop_reason": stop_reason, "tokens": written_tokens,
                        "total_samples": total_samples,
                        "stop_after_record": stop_after_record,
