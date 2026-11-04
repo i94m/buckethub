@@ -723,3 +723,48 @@ class TestRollingMultiWriter(unittest.TestCase):
         r3 = json.loads((self.st_b / dp.UPLOAD_REPORT).read_text())
         self.assertEqual(r3["uploaded"], [])
         self.assertEqual(self.manifest()["delivery_id"], m2["delivery_id"])
+
+
+class TestPerSourceSubdir(unittest.TestCase):
+    """按源文件子目录上传：每件一个前缀，不互相影响、不需要 rolling。"""
+
+    @classmethod
+    def setUpClass(cls):
+        if not _have("tiktoken"):
+            raise unittest.SkipTest("tiktoken 未安装，跳过")
+        cls._tmp = tempfile.TemporaryDirectory(prefix="delivery_subdir_")
+        cls.tmp = Path(cls._tmp.name)
+        cls.out = build_delivery(cls.tmp / "r")
+        cls.sim = cls.tmp / "sim"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def test_subdir_upload_with_include(self):
+        report = self.tmp / "accept-report.json"
+        report.write_text('{"ok": true, "content_dup_pairs": 3}', encoding="utf-8")
+        prefix = "2026-11-04/gpt-6-astra-0001-20261001/"
+        rc = dp.main([str(self.out), "--execute", "--simulate-local-s3", str(self.sim),
+                      "--target-prefix", prefix, "--include", str(report),
+                      "--staging-dir", str(self.tmp / "st")])
+        self.assertEqual(rc, 0)
+        base = self.sim / "objects" / prefix
+        self.assertTrue((base / "delivery-manifest.json").exists())
+        m = json.loads((base / "delivery-manifest.json").read_text())
+        self.assertEqual([e["name"] for e in m["extra_documents"]], ["accept-report.json"])
+        self.assertEqual(m["object_count"], len(m["objects"]) + 3)  # 分片 + 2 文档 + 1 随附
+        files = [p.name for p in base.rglob("*") if p.is_file()]
+        self.assertEqual(len(files), m["object_count"])
+        readme = (base / "README.md").read_text(encoding="utf-8")
+        self.assertIn("content_dup_pairs", readme)
+        self.assertIn("不是缺陷", readme)
+        self.assertIn("accept-report.json", readme)
+
+        # 另一个 key 写到另一个前缀：互不干扰，不需要 rolling
+        rc = dp.main([str(self.out), "--execute", "--simulate-local-s3", str(self.sim),
+                      "--target-prefix", "2026-11-04/gpt-6-astra-0002-20261001/",
+                      "--staging-dir", str(self.tmp / "st2")])
+        self.assertEqual(rc, 0)
+        self.assertTrue((self.sim / "objects" / "2026-11-04" / "gpt-6-astra-0002-20261001"
+                         / "delivery-manifest.json").exists())

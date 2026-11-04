@@ -493,10 +493,11 @@ class Packed:
     delivery_id: str
     config: dict
     target_prefix: str
+    extras: list = field(default_factory=list)
     manifest_obj: Object = None
 
     def all_objects(self) -> list:
-        return list(self.objects) + list(self.docs)
+        return list(self.objects) + list(self.docs) + list(self.extras)
 
 
 def _load_pack_state(staging: Path) -> dict:
@@ -511,7 +512,7 @@ def _load_pack_state(staging: Path) -> dict:
 
 def pack(delivery: Delivery, staging: Path, level: int, threads: int,
          target_prefix: str, source_url: str, force: bool = False,
-         bucket: str = "") -> Packed:
+         bucket: str = "", include=()) -> Packed:
     staging.mkdir(parents=True, exist_ok=True)
     state = _load_pack_state(staging)
     entries = dict(state.get("entries") or {})
@@ -648,6 +649,18 @@ def pack(delivery: Delivery, staging: Path, level: int, threads: int,
     for o in objects:
         o.metadata.update({"delivery-id": delivery_id, "spec": SCHEMA})
 
+    for path in include or ():
+        path = Path(path)
+        if not path.exists():
+            raise DeliveryError(f"--include 的文件不存在：{path}")
+        ctype = ("application/json" if path.suffix == ".json"
+                 else "text/markdown; charset=utf-8" if path.suffix in (".md", ".markdown")
+                 else "application/octet-stream")
+        packed.extras.append(Object(
+            name=path.name, path=path, size=path.stat().st_size,
+            sha256=sha256_file(path), content_type=ctype, kind="extra",
+            metadata={"sha256": sha256_file(path), "delivery-id": delivery_id,
+                      "spec": SCHEMA}))
     _write_docs(packed, source_url)
     write_json(staging / PACK_STATE, {
         "schema": SCHEMA, "level": level, "threads": threads,
@@ -713,7 +726,9 @@ def _write_docs(packed: Packed, source_url: str) -> None:
             "name": DELIVERY_MANIFEST,
             "note": "清单不写自己这一行的 sha256（自指写不进去）；上传后由 upload-report.json 记录",
         },
-        "object_count": len(packed.objects) + 2,
+        "extra_documents": [{"name": o.name, "size": o.size, "sha256": o.sha256}
+                            for o in packed.extras],
+        "object_count": len(packed.objects) + 2 + len(packed.extras),
         "pipeline": {
             "stop_reason": packed.delivery.manifest.get("STOP_REASON"),
             "stop_file": packed.delivery.manifest.get("stop_file"),
@@ -869,6 +884,13 @@ def _render_readme(packed: Packed, m: dict) -> str:
         f"未压缩 {human_bytes(t['bytes_raw'])} → 压缩 {human_bytes(t['bytes_zst'])}"
         f"（{t['compression_ratio']}×）。")
     add("")
+    extras = m.get("extra_documents") or []
+    if extras:
+        add("随附文件：")
+        add("")
+        for e in extras:
+            add(f"- `{e['name']}`（{e['size']} 字节，sha256 `{e['sha256']}`）")
+        add("")
     add("## 三、复算命令")
     add("")
     add("```bash")
@@ -911,7 +933,14 @@ def _render_readme(packed: Packed, m: dict) -> str:
     add("  - `kept_records = delivered_records + not_delivered`")
     add("  - `delivered_windows ≥ delivered_records`（切窗记录一行多窗口）")
     add("")
-    add("## 五、完整性")
+    add("## 五、重复内容说明（`content_dup_pairs`）")
+    add("")
+    add("`content_dup_pairs` 统计的是**内容相同、但 session uuid 不同**的记录对。按锁定口径，"
+        "`seq` 以 session 为边界计算，这类记录属于**不同记录**，因此**已原样保留**；"
+        "此计数仅提示内容重复，不是缺陷，不应当作需要删除的重复数据。"
+        "（同一 session 内 `seq` 互为前缀的记录仍按去重规则丢弃，那部分已计入 `prefix_removed`。）")
+    add("")
+    add("## 六、完整性")
     add("")
     add("每个对象在桶上的 `ContentLength` 与 `x-amz-meta-sha256` 都已在上传时核对；"
         "最大的分片做过全文回读 sha256 比对；桶内对象数与 `delivery-manifest.json` 的 "
@@ -1269,7 +1298,14 @@ def merge_manifests(prev: dict, local: dict) -> dict:
     merged["files"] = sorted(files.values(), key=lambda f: f["source_key"])
     merged["objects"] = sorted(objects.values(), key=lambda o: o["name"])
     merged["totals"] = _merge_totals(merged["files"])
-    merged["object_count"] = len(merged["objects"]) + 2
+    extras = {e["name"]: e for e in prev.get("extra_documents") or []}
+    for e in local.get("extra_documents") or []:
+        old = extras.get(e["name"])
+        if old is not None and old.get("sha256") != e.get("sha256"):
+            raise ConflictError(f"同名随附文件在两轮里内容不同：{e['name']}")
+        extras[e["name"]] = e
+    merged["extra_documents"] = sorted(extras.values(), key=lambda e: e["name"])
+    merged["object_count"] = len(merged["objects"]) + 2 + len(merged["extra_documents"])
     ident = json.dumps(sorted([[o["name"], o["sha256"], o["size"]]
                                for o in merged["objects"]]),
                        ensure_ascii=False, separators=(",", ":"))
@@ -1617,6 +1653,8 @@ def build_parser(argv=None):
                     help="额外放行的 STOP_REASON（合并目录自定义终态用，可重复）")
     ap.add_argument("--allow-extra-objects", action="store_true",
                     help="目标目录里有 manifest 之外的对象时只警告（默认视为不一致并失败）")
+    ap.add_argument("--include", action="append", default=[], metavar="PATH",
+                    help="随交付一起上传的附加文件（如 accept-report.json），可重复")
     ap.add_argument("--force-pack", action="store_true", help="忽略压缩缓存，全部重压")
     ap.add_argument("--ignore-lock", action="store_true", help="忽略 run.lock（确认没有实例在跑时用）")
     ap.add_argument("--lock-ttl", type=int, default=300)
@@ -1683,7 +1721,8 @@ def main(argv=None) -> int:
                   f"{cfg.get('prefix') or ''}")
     try:
         packed = pack(delivery, staging, args.level, args.threads, target,
-                      source_url, force=args.force_pack, bucket=bucket)
+                      source_url, force=args.force_pack, bucket=bucket,
+                      include=args.include)
     except DeliveryError as e:
         print(f"[error] {e}", file=sys.stderr)
         return 2

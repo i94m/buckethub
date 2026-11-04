@@ -106,7 +106,28 @@ python delivery/delivery_pack.py <OUT>/full --execute --date 2026-11-04
 - **停因**：默认接受 `corpus_exhausted` / `token_target_reached` / `merged`；
   合并层若用别的终态名，用 `--allow-stop-reason <REASON>` 显式放行。
 
-## 五、滚动上传（`--rolling`）
+## 五、按源文件子目录上传（推荐布局）
+
+每件交付写自己的前缀，互不重叠、不需要滚动：
+
+```bash
+python delivery/delivery_pack.py <OUT_DIR> --execute \
+  --target-prefix 2026-11-04/gpt-6-astra-0001-20261001/ \
+  --include <OUT_DIR>/accept-report.json
+```
+
+```
+2026-11-04/gpt-6-astra-0001-20261001/
+   gpt-6-astra-0001-20261001.jsonl.zst
+   delivery-manifest.json     # 只描述这一件
+   README.md                  # A1 口径 + content_dup_pairs 说明 + 复算命令
+   accept-report.json         # --include 带进来的随附文件
+```
+
+`--include` 可重复，随附文件会进 `extra_documents` 并计入 `object_count`（分片 + 2 文档 + N 随附）。
+多个 key 各写各的前缀，**可以多台并发**，不需要等谁。
+
+## 六、滚动上传（`--rolling`）
 
 同一个日期目录分多轮上传（每跑完一个 key 就追加一批）：
 
@@ -132,7 +153,7 @@ python delivery/delivery_pack.py <OUT> --execute --date 2026-11-04 --rolling
 
 其它不变：`head_object` 核 `ContentLength` + `sha256` 元数据、最大分片与两个文档全文回读、同一目录续跑沿用上次目标、自己写了一半的对象可重传。`--rolling` 只是把「清单/README 可替换」这条口子打开，分片的不可变契约一字未放宽。
 
-## 六、上传后校验
+## 七、上传后校验
 
 1. 每个对象上传后立刻 `head_object`：`ContentLength` == 本地字节数，且
    `x-amz-meta-sha256` == 本地压缩后 sha256（不符 → 退出码 4）。
@@ -141,7 +162,7 @@ python delivery/delivery_pack.py <OUT> --execute --date 2026-11-04 --rolling
    也全文回读比对。
 4. 结果写 `upload-report.json`；命令行打印「上传 N / 重传 N / 跳过 N / 回读 N 一致」。
 
-## 七、退出码
+## 八、退出码
 
 | 码 | 含义 |
 | --- | --- |
@@ -151,7 +172,7 @@ python delivery/delivery_pack.py <OUT> --execute --date 2026-11-04 --rolling
 | 4 | 上传后校验失败（大小、元数据、对象集合、回读 sha256） |
 | 137 | 自测注入中断（`--simulate-fail-after`） |
 
-## 八、前置校验（不通过直接退出码 2）
+## 九、前置校验（不通过直接退出码 2）
 
 - `manifest.json` 存在且 `STOP_REASON ∈ {corpus_exhausted, token_target_reached}`；
   `segment_paused` 明确拒绝（那是分段中间态，不是终态）。
@@ -162,7 +183,7 @@ python delivery/delivery_pack.py <OUT> --execute --date 2026-11-04 --rolling
 - 分片 token 之和 == `manifest.delivered_tokens`；逐文件与 `ledger.json` 的
   `delivered_windows` / `delivered_tokens` 对得上。
 
-## 九、自测（离线，不需要凭证）
+## 十、自测（离线，不需要凭证）
 
 ```bash
 python -m unittest discover -s delivery/tests -v     # 24 例
@@ -181,7 +202,7 @@ python -m unittest discover -s delivery/tests -v     # 24 例
 清单自洽（合并 totals、同源多片的聚合 sha256）、上传校验，以及断号/重号/
 totals 没重算三种合并事故都会被拦下。
 
-## 十、磁盘与耗时预算
+## 十一、磁盘与耗时预算
 
 - 额外磁盘 ≈ 压缩后体积（JSONL 文本 zstd level 10 约 1/8~1/12），默认就写在交付目录的
   `_delivery_pack/` 下；磁盘紧就用 `--staging-dir` 指到别处。
