@@ -1214,45 +1214,157 @@ def snapshot_prev_manifest(transport, target: str, staging: Path):
     return skey
 
 
+
+def _file_sig(f: dict) -> str:
+    return json.dumps([[p.get("name"), p.get("sha256_zst")] for p in f.get("parts") or []],
+                      sort_keys=True)
+
+
+def _merge_totals(files: list) -> dict:
+    t = {
+        "files": len(files),
+        "parts": sum(len(f.get("parts") or []) for f in files),
+        "records": sum(int(f.get("records") or 0) for f in files),
+        "windows": sum(int(f.get("windows") or 0) for f in files),
+        "tokens": sum(int(f.get("tokens") or 0) for f in files),
+        "bytes_raw": sum(int(f.get("bytes_raw") or 0) for f in files),
+        "bytes_zst": sum(int(f.get("bytes_zst") or 0) for f in files),
+    }
+    t["compression_ratio"] = (round(t["bytes_raw"] / t["bytes_zst"], 3)
+                              if t["bytes_zst"] else None)
+    return t
+
+
+def merge_manifests(prev: dict, local: dict) -> dict:
+    """rolling 的清单合并：只增不减。上一轮的文件行/对象行并进本轮清单。
+
+    多台机各写各的 key 时，本地清单只含自己那几件——不合并的话第二轮清单会把
+    第一轮的交付"从清单里抹掉"。这里按 source_key / name 取并集；同名但内容不同
+    说明两轮对同一个对象有两种说法，直接冲突（绝不静默覆盖）。
+    """
+    files = {f["source_key"]: f for f in prev.get("files") or []}
+    for f in local.get("files") or []:
+        old = files.get(f["source_key"])
+        if old is not None and _file_sig(old) != _file_sig(f):
+            raise ConflictError(f"同一源文件在两轮里内容不同：{f['source_key']}")
+        files[f["source_key"]] = f
+
+    objects = {o["name"]: o for o in prev.get("objects") or []}
+    for o in local.get("objects") or []:
+        old = objects.get(o["name"])
+        if old is not None and old.get("sha256") != o.get("sha256"):
+            raise ConflictError(f"同名分片在两轮里内容不同：{o['name']}")
+        objects[o["name"]] = o
+
+    prev_objects = {o["name"]: o for o in prev.get("objects") or []}
+    prev_files = {f["source_key"]: f for f in prev.get("files") or []}
+    no_new = all(name in prev_objects and prev_objects[name].get("sha256") == row.get("sha256")
+                 for name, row in objects.items() if prev_objects)
+    no_new = no_new and all(key in prev_files and _file_sig(prev_files[key]) == _file_sig(row)
+                            for key, row in files.items())
+    if no_new and prev_objects:
+        return prev          # 这一轮没有新增：原样沿用上一轮清单，保证重跑幂等
+
+    merged = dict(local)
+    merged["files"] = sorted(files.values(), key=lambda f: f["source_key"])
+    merged["objects"] = sorted(objects.values(), key=lambda o: o["name"])
+    merged["totals"] = _merge_totals(merged["files"])
+    merged["object_count"] = len(merged["objects"]) + 2
+    ident = json.dumps(sorted([[o["name"], o["sha256"], o["size"]]
+                               for o in merged["objects"]]),
+                       ensure_ascii=False, separators=(",", ":"))
+    merged["delivery_id"] = hashlib.sha256(ident.encode("utf-8")).hexdigest()
+
+    prov = dict(local.get("provenance") or {})
+    machines = sorted({m for f in merged["files"] for m in (f.get("machines") or [])})
+    per = {}
+    for f in merged["files"]:
+        for part in f.get("parts") or []:
+            m = part.get("machine") or ""
+            if m:
+                per[m] = per.get(m, 0) + 1
+    prov.update({"machines": machines, "multi_machine": len(machines) > 1,
+                 "shards_per_machine": per})
+    merged["provenance"] = prov
+    merged["rolling"] = {
+        "rounds": int((prev.get("rolling") or {}).get("rounds", 1)) + 1,
+        "previous_delivery_id": prev.get("delivery_id"),
+    }
+    return merged
+
+
+def write_merged_docs(packed: Packed, merged: dict) -> None:
+    """把合并后的清单/README 写回暂存目录，并同步 packed.docs 的哈希。"""
+    staging = packed.staging
+    readme_path = staging / DELIVERY_README
+    readme_path.write_text(_render_readme(packed, merged), encoding="utf-8")
+    merged["readme"] = {"name": DELIVERY_README,
+                        "size": readme_path.stat().st_size,
+                        "sha256": sha256_file(readme_path)}
+    write_json(staging / DELIVERY_MANIFEST, merged)
+    mpath = staging / DELIVERY_MANIFEST
+    packed.docs = [
+        Object(name=DELIVERY_README, path=readme_path, size=readme_path.stat().st_size,
+               sha256=sha256_file(readme_path),
+               content_type="text/markdown; charset=utf-8", kind="doc",
+               metadata={"sha256": sha256_file(readme_path),
+                         "delivery-id": merged["delivery_id"], "spec": SCHEMA}),
+        Object(name=DELIVERY_MANIFEST, path=mpath, size=mpath.stat().st_size,
+               sha256=sha256_file(mpath), content_type="application/json", kind="doc",
+               metadata={"sha256": sha256_file(mpath),
+                         "delivery-id": merged["delivery_id"], "spec": SCHEMA}),
+    ]
+    packed.manifest_obj = packed.docs[1]
+
+
 def upload(packed: Packed, transport, args, put: bool = True) -> dict:
     staging = packed.staging
     target = packed.target_prefix
+    rolling = bool(getattr(args, "rolling", False))
+    prev_manifest = None
+    if rolling:
+        prev_manifest, _prev_raw = load_prev_manifest(transport, target)
+        if prev_manifest is not None:
+            local_manifest = read_json(staging / DELIVERY_MANIFEST)
+            merged = merge_manifests(prev_manifest, local_manifest)
+            if not _payload_equal(merged, read_json(staging / DELIVERY_MANIFEST), ()):
+                # 本轮要上传的清单就是合并后的这份（哪怕"没有新增"，也要把上一轮的
+                # 完整清单原样写回，避免把桶里的清单替换成只含本机那几件的版本）
+                write_merged_docs(packed, merged)
+                print(f"[rolling] 清单已合并：上一轮 {len(prev_manifest.get('objects') or [])} 个对象"
+                      f" + 本轮 {len(local_manifest.get('objects') or [])} 个对象"
+                      f" → 交付对象数 {merged['object_count']}")
     journal = load_journal(staging)
     plan = packed.all_objects()
+    merged_manifest = read_json(staging / DELIVERY_MANIFEST)
+    all_expected = {target + o["name"] for o in merged_manifest.get("objects") or []}
+    all_expected |= {o.key(target) for o in packed.docs}
+    prev_objs = {target + o["name"]: {"size": o.get("size"), "sha256": o.get("sha256")}
+                 for o in (prev_manifest or {}).get("objects") or []
+                 if target + o["name"] not in {x.key(target) for x in plan}}
     remote = transport.list_prefix(target)
     # 列表只给大小，sha256 在对象元数据里：对已存在的同名对象补一次 head
     heads = {o.key(target): transport.head(o.key(target))
              for o in plan if o.key(target) in remote}
 
-    rolling = bool(getattr(args, "rolling", False))
     decisions = []
     conflicts = []
-    expected_keys = {o.key(target) for o in plan}
     snap_prefix = target + SNAPSHOT_DIR + "/"
-    subset_ok, subset_problems = True, []
-    if rolling and remote:
-        prev_manifest, _prev_raw = load_prev_manifest(transport, target)
-        if prev_manifest is not None:
-            subset_ok, subset_problems = prev_subset_ok(prev_manifest, plan, target)
 
     if remote and not args.allow_extra_objects:
-        for k in sorted(set(remote) - expected_keys):
+        for k in sorted(set(remote) - all_expected):
             if rolling and k.startswith(snap_prefix):
                 continue        # rolling 的历史清单快照是有意留下的
             conflicts.append({
                 "key": k,
                 "reason": "目标目录里已有非本次交付的对象（本工具只写全新目录，绝不覆盖；"
                           "换 --new-target，或确认后加 --allow-extra-objects）"})
-    if rolling and not subset_ok:
-        conflicts.append({
-            "key": target + DELIVERY_MANIFEST,
-            "reason": "rolling 只允许追加：" + "；".join(subset_problems[:5])})
 
     for obj in plan:
         key = obj.key(target)
         row = journal["objects"].get(key)
         decision = _classify(heads.get(key), obj, row, allow_repair=not args.no_repair)
-        if decision == "conflict" and rolling and subset_ok and obj.kind == "doc":
+        if decision == "conflict" and rolling and obj.kind == "doc":
             decision = "replace"       # 只有清单/README 允许整体替换
         if decision == "conflict":
             r = heads.get(key) or {}
@@ -1277,13 +1389,15 @@ def upload(packed: Packed, transport, args, put: bool = True) -> dict:
 
     if not put:
         readbacks = verify_remote(packed, transport, target,
-                                  allow_extra=args.allow_extra_objects, rolling=rolling)
+                                  allow_extra=args.allow_extra_objects, rolling=rolling,
+                                  extra_expected=prev_objs)
         report = {
             "schema": SCHEMA, "generated_at": now_iso(),
             "delivery_id": packed.delivery_id, "bucket": transport.bucket,
             "target_prefix": target,
-            "object_count": {"expected": len(plan),
-                             "remote": len(transport.list_prefix(target))},
+            "object_count": {"expected": len(all_expected),
+                             "remote": len([k for k in transport.list_prefix(target)
+                                            if not k.startswith(target + SNAPSHOT_DIR + "/")])},
             "uploaded": [], "repaired": [], "skipped": [
                 k for _, k, d in decisions if d in ("skip", "verify")],
             "readback": readbacks, "totals": packed.totals, "ok": True,
@@ -1339,7 +1453,8 @@ def upload(packed: Packed, transport, args, put: bool = True) -> dict:
 
     # 对象集合必须与 manifest 完全一致 + 回读抽检
     readbacks = verify_remote(packed, transport, target,
-                              allow_extra=args.allow_extra_objects, rolling=rolling)
+                              allow_extra=args.allow_extra_objects, rolling=rolling,
+                              extra_expected=prev_objs)
 
     report = {
         "schema": SCHEMA,
@@ -1347,8 +1462,9 @@ def upload(packed: Packed, transport, args, put: bool = True) -> dict:
         "delivery_id": packed.delivery_id,
         "bucket": transport.bucket,
         "target_prefix": target,
-        "object_count": {"expected": len({o.key(target) for o in plan}),
-                         "remote": len(transport.list_prefix(target))},
+        "object_count": {"expected": len(all_expected),
+                         "remote": len([k for k in transport.list_prefix(target)
+                                        if not k.startswith(target + SNAPSHOT_DIR + "/")])},
         "uploaded": done,
         "repaired": repaired,
         "replaced": replaced,
@@ -1366,7 +1482,7 @@ def upload(packed: Packed, transport, args, put: bool = True) -> dict:
 
 
 def verify_remote(packed: Packed, transport, target: str, allow_extra: bool = False,
-                  rolling: bool = False) -> list:
+                  rolling: bool = False, extra_expected: dict | None = None) -> list:
     """对象集合逐一对齐 + 每个对象 head 核大小/元数据 + 最大分片与文档全文回读。
 
     rolling 模式下，`<target>manifests/` 下的历史清单快照不算"多余对象"
@@ -1375,6 +1491,7 @@ def verify_remote(packed: Packed, transport, target: str, allow_extra: bool = Fa
     plan = packed.all_objects()
     remote = transport.list_prefix(target)
     expected = {o.key(target) for o in plan}
+    expected |= set(extra_expected or {})
     got = set(remote)
     if rolling:
         snap_prefix = target + SNAPSHOT_DIR + "/"
@@ -1396,6 +1513,15 @@ def verify_remote(packed: Packed, transport, target: str, allow_extra: bool = Fa
                               f"≠ 本地 {obj.size}")
         if (h.get("metadata") or {}).get("sha256") != obj.sha256:
             raise VerifyError(f"对象元数据 sha256 不符：{obj.key(target)}")
+
+    for key, want in (extra_expected or {}).items():
+        h = transport.head(key)
+        if h is None:
+            raise VerifyError(f"上一轮的交付对象不见了：{key}")
+        if h["size"] != want["size"]:
+            raise VerifyError(f"上一轮对象字节数变了：{key} {h['size']} ≠ {want['size']}")
+        if (h.get("metadata") or {}).get("sha256") != want["sha256"]:
+            raise VerifyError(f"上一轮对象 sha256 变了：{key}")
 
     readbacks = []
     shards = sorted(packed.objects, key=lambda o: o.size, reverse=True)

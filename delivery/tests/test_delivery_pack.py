@@ -583,8 +583,8 @@ class TestRolling(unittest.TestCase):
                          ["2026-11-04/README.md", "2026-11-04/delivery-manifest.json"])
         self.assertEqual(len(report["snapshots"]), 1)
         self.assertEqual(report["object_count"]["expected"], m2["object_count"])
-        self.assertEqual(report["object_count"]["remote"],
-                         m2["object_count"] + 1)  # +1 = manifests/ 快照
+        self.assertEqual(report["object_count"]["remote"], m2["object_count"],
+                         "对象数核对不含 manifests/ 快照")
         self.assertEqual(len(keys2), m2["object_count"] + 1)
 
         # 快照内容 = 第 1 轮清单
@@ -598,8 +598,14 @@ class TestRolling(unittest.TestCase):
         self.assertEqual(r3["replaced"], [])
         self.assertEqual(len(r3["skipped"]), m2["object_count"])
 
-        # 用旧目录（少一个 key）去 rolling：上一轮对象集不是本轮子集 → 必须停
-        self.assertEqual(self.run_pack(self.out1, self.st3, "--rolling"), 3)
+        # 用"少一个 key 的旧目录"去 rolling：清单合并是只增不减，旧的 3 个文件仍在，
+        # 不会把已交付的对象从清单里抹掉（第 3 轮不丢行、不删对象）。
+        self.assertEqual(self.run_pack(self.out1, self.st3, "--rolling"), 0)
+        m_after = json.loads((self.sim / "objects" / "2026-11-04"
+                              / "delivery-manifest.json").read_text())
+        self.assertEqual(len(m_after["files"]), len(m2["files"]), "合并后文件数不能少")
+        for o in m2["objects"]:
+            self.assertIn(o["name"], [x["name"] for x in m_after["objects"]])
 
     def test_rolling_reuses_existing_dir_without_target_prefix(self):
         # 不显式给 --target-prefix，rolling 也应自动认领已有日期目录，而不是新开 -delivery-1
@@ -627,3 +633,93 @@ class TestRolling(unittest.TestCase):
                                                  "size": 10}]}, plan, "p/")
         self.assertFalse(ok)
         self.assertIn("不可变", why[0])
+
+
+class TestRollingMultiWriter(unittest.TestCase):
+    """两台机各写各的 key：第二台本地清单只有自己那件，必须合并上一轮清单。"""
+
+    @classmethod
+    def setUpClass(cls):
+        if not _have("tiktoken"):
+            raise unittest.SkipTest("tiktoken 未安装，跳过")
+        import corpus_pipeline as cp
+
+        cls._tmp = tempfile.TemporaryDirectory(prefix="delivery_mw_")
+        cls.tmp = Path(cls._tmp.name)
+        raw_a = cls.tmp / "a" / "raw"
+        raw_a.mkdir(parents=True)
+        for i, name in enumerate(["gpt-6-astra-0001-20261001.jsonl",
+                                  "gpt-6-astra-0002-20261001.jsonl"]):
+            with open(raw_a / name, "w", encoding="utf-8") as fh:
+                for j in range(2):
+                    fh.write(json.dumps(make_record(700 + i * 10 + j), ensure_ascii=False) + "\n")
+        cls.out_a = cls.tmp / "a" / "out"
+        assert cp.main(["--local-dir", str(raw_a), "--execute", "--out-dir", str(cls.out_a),
+                        "--target-tokens", "1000000000", "--shard-bytes", "30000"]) == 0
+
+        raw_b = cls.tmp / "b" / "raw"
+        raw_b.mkdir(parents=True)
+        with open(raw_b / "gpt-6-sol-0005-20261001.jsonl", "w", encoding="utf-8") as fh:
+            for j in range(2):
+                fh.write(json.dumps(make_record(800 + j), ensure_ascii=False) + "\n")
+        cls.out_b = cls.tmp / "b" / "out"
+        assert cp.main(["--local-dir", str(raw_b), "--execute", "--out-dir", str(cls.out_b),
+                        "--target-tokens", "1000000000", "--shard-bytes", "30000"]) == 0
+
+        cls.sim = cls.tmp / "sim"
+        cls.st_a = cls.tmp / "st_a"
+        cls.st_b = cls.tmp / "st_b"
+        cls.args = ["--execute", "--simulate-local-s3", str(cls.sim),
+                    "--date", "2026-11-04"]
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def manifest(self):
+        return json.loads((self.sim / "objects" / "2026-11-04"
+                           / "delivery-manifest.json").read_text())
+
+    def test_two_writers_merge(self):
+        # 写者 A（相当于 T14）：首个写入，建目录 + 首版清单
+        rc = dp.main([str(self.out_a)] + self.args + ["--staging-dir", str(self.st_a)])
+        self.assertEqual(rc, 0)
+        m1 = self.manifest()
+        self.assertEqual(len(m1["files"]), 2)
+
+        # 写者 B（相当于 HK）：本地只有自己的 1 个源文件，清单必须并上 A 的
+        rc = dp.main([str(self.out_b)] + self.args + ["--staging-dir", str(self.st_b),
+                                                      "--rolling"])
+        self.assertEqual(rc, 0, "第二台写者必须能并入同一目录")
+        m2 = self.manifest()
+        keys = {f["source_key"] for f in m2["files"]}
+        self.assertEqual(keys, {f["source_key"] for f in m1["files"]} |
+                         {"gpt-6-sol-0005-20261001.jsonl"})
+        self.assertEqual(m2["object_count"], len(m2["objects"]) + 2)
+        self.assertEqual(m2["rolling"]["rounds"], 2)
+        self.assertEqual(m2["rolling"]["previous_delivery_id"], m1["delivery_id"])
+
+        # 桶内交付对象数 == 清单对象数（不含 manifests/ 快照）
+        base = self.sim / "objects" / "2026-11-04"
+        objs = [p for p in base.rglob("*") if p.is_file() and "manifests" not in p.parts]
+        self.assertEqual(len(objs), m2["object_count"])
+        report = json.loads((self.st_b / dp.UPLOAD_REPORT).read_text())
+        self.assertEqual(report["object_count"]["expected"], m2["object_count"])
+        self.assertEqual(report["object_count"]["remote"], m2["object_count"])
+
+        # A 的分片一个没丢、sha 未变
+        for o in m1["objects"]:
+            self.assertIn(o["name"], [x["name"] for x in m2["objects"]])
+        # 分片总字节 = 两轮之和
+        self.assertEqual(m2["totals"]["parts"],
+                         sum(len(f["parts"]) for f in m2["files"]))
+        self.assertEqual(m2["totals"]["tokens"],
+                         sum(f["tokens"] for f in m2["files"]))
+
+        # 再跑一次 B（幂等）：不重传、清单不变
+        rc = dp.main([str(self.out_b)] + self.args + ["--staging-dir", str(self.st_b),
+                                                      "--rolling"])
+        self.assertEqual(rc, 0)
+        r3 = json.loads((self.st_b / dp.UPLOAD_REPORT).read_text())
+        self.assertEqual(r3["uploaded"], [])
+        self.assertEqual(self.manifest()["delivery_id"], m2["delivery_id"])

@@ -123,6 +123,13 @@ python delivery/delivery_pack.py <OUT> --execute --date 2026-11-04 --rolling
 | `manifests/<utc>-<sha12>.json` | 替换前把旧清单原样快照到桶上，可回溯每一轮的清单 |
 | 对象数核对 | 交付对象数 == 桶内对象数（`manifests/` 快照不计入） |
 
+**多机各写各的 key（串行写入同一目录）**：每台的本地清单只含自己那几件，
+所以 rolling 会把**桶上上一轮清单并进本轮清单**——按 `source_key` / `name` 取并集、
+只增不减，重算 `totals` / `delivery_id` / `object_count`，并在 `rolling.rounds` 里记轮次。
+两台机先后写同一目录（A 写 astra-0009、B 写 sol-0001）是支持的：B 的清单会自动包含 A 的条目。
+同一对象在两轮里有两份不同内容 → 冲突整批停（不静默覆盖）。**同一时刻仍只允许一个写者**：
+并发写会互相覆盖清单（后者并的是"上上轮"），虽然不会丢分片，但清单会缺中间那轮。
+
 其它不变：`head_object` 核 `ContentLength` + `sha256` 元数据、最大分片与两个文档全文回读、同一目录续跑沿用上次目标、自己写了一半的对象可重传。`--rolling` 只是把「清单/README 可替换」这条口子打开，分片的不可变契约一字未放宽。
 
 ## 六、上传后校验
@@ -158,7 +165,7 @@ python delivery/delivery_pack.py <OUT> --execute --date 2026-11-04 --rolling
 ## 九、自测（离线，不需要凭证）
 
 ```bash
-python -m unittest discover -s delivery/tests -v     # 23 例
+python -m unittest discover -s delivery/tests -v     # 24 例
 ```
 
 合成交付目录由 `pipeline/corpus_pipeline.py --local-dir` 真跑产生（不是手写 manifest），
