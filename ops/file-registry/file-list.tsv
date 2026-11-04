@@ -22,8 +22,8 @@ rank	key	bytes	owner	local_copy	download_status	index_status	delivery_status
 21	Gpt-2026-10-18/gpt-6-sol-0002-20261001.jsonl	27060435094	Macbook Pro	-	in_progress	pending	pending
 22	Gpt-2026-10-18/gpt-6-sol-0003-20261001.jsonl	26595561759	Macbook Pro	-	in_progress	pending	pending
 23	Gpt-2026-10-18/gpt-6-sol-0004-20261001.jsonl	25825295428	Alienware	/data/corpus-mirror/Gpt-2026-10-18/gpt-6-sol-0004-20261001.jsonl	done	done	delivered
-24	Gpt-2026-10-18/gpt-6-sol-0005-20261001.jsonl	28045084748	Alienware	/data/corpus-mirror/Gpt-2026-10-18/gpt-6-sol-0005-20261001.jsonl	downloading	-	pending
-25	Gpt-2026-10-18/gpt-6-sol-0006-20261001.jsonl	28644648289	Alienware	/data/corpus-mirror/Gpt-2026-10-18/gpt-6-sol-0006-20261001.jsonl	pending	-	pending
+24	Gpt-2026-10-18/gpt-6-sol-0005-20261001.jsonl	28045084748	Alienware	/data/corpus-mirror/Gpt-2026-10-18/gpt-6-sol-0005-20261001.jsonl	done	done	delivered
+25	Gpt-2026-10-18/gpt-6-sol-0006-20261001.jsonl	28644648289	Alienware	/data/corpus-mirror/Gpt-2026-10-18/gpt-6-sol-0006-20261001.jsonl	downloading	-	pending
 26	Gpt-2026-10-18/gpt-6-sol-0007-20261001.jsonl	25933986099	Alienware	/data/corpus-mirror/Gpt-2026-10-18/gpt-6-sol-0007-20261001.jsonl	done	done	delivered
 27	Gpt-2026-10-18/gpt-6-sol-0008-20261001.jsonl	26725316927	Alienware	/data/corpus-mirror/Gpt-2026-10-18/gpt-6-sol-0008-20261001.jsonl	done	done	verify_red
 28	Gpt-2026-10-18/gpt-6-sol-0009-20261001.jsonl	26657353494	Alienware	/data/corpus-mirror/Gpt-2026-10-18/gpt-6-sol-0009-20261001.jsonl	done	done	verify_red
