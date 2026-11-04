@@ -649,8 +649,15 @@ def pack(delivery: Delivery, staging: Path, level: int, threads: int,
     for o in objects:
         o.metadata.update({"delivery-id": delivery_id, "spec": SCHEMA})
 
-    for path in include or ():
+    # 默认随附「证据文件」：pipeline 的 manifest.json 与 ledger.json，买家才能自己跑复算
+    auto = [delivery.root / PIPELINE_MANIFEST, delivery.root / PIPELINE_LEDGER]
+    include = [str(p) for p in auto if p.exists()] + [str(x) for x in (include or ())]
+    seen_names = set()
+    for path in include:
         path = Path(path)
+        if path.name in seen_names:
+            continue
+        seen_names.add(path.name)
         if not path.exists():
             raise DeliveryError(f"--include 的文件不存在：{path}")
         ctype = ("application/json" if path.suffix == ".json"
@@ -1300,9 +1307,8 @@ def merge_manifests(prev: dict, local: dict) -> dict:
     merged["totals"] = _merge_totals(merged["files"])
     extras = {e["name"]: e for e in prev.get("extra_documents") or []}
     for e in local.get("extra_documents") or []:
-        old = extras.get(e["name"])
-        if old is not None and old.get("sha256") != e.get("sha256"):
-            raise ConflictError(f"同名随附文件在两轮里内容不同：{e['name']}")
+        # 随附文件（manifest.json / ledger.json / accept-report）各轮内容不同是常态：
+        # 以本轮为准，不在两轮之间做冲突判断（分片仍然严格不可变）
         extras[e["name"]] = e
     merged["extra_documents"] = sorted(extras.values(), key=lambda e: e["name"])
     merged["object_count"] = len(merged["objects"]) + 2 + len(merged["extra_documents"])
@@ -1375,6 +1381,7 @@ def upload(packed: Packed, transport, args, put: bool = True) -> dict:
     merged_manifest = read_json(staging / DELIVERY_MANIFEST)
     all_expected = {target + o["name"] for o in merged_manifest.get("objects") or []}
     all_expected |= {o.key(target) for o in packed.docs}
+    all_expected |= {o.key(target) for o in packed.extras}
     prev_objs = {target + o["name"]: {"size": o.get("size"), "sha256": o.get("sha256")}
                  for o in (prev_manifest or {}).get("objects") or []
                  if target + o["name"] not in {x.key(target) for x in plan}}
@@ -1400,8 +1407,8 @@ def upload(packed: Packed, transport, args, put: bool = True) -> dict:
         key = obj.key(target)
         row = journal["objects"].get(key)
         decision = _classify(heads.get(key), obj, row, allow_repair=not args.no_repair)
-        if decision == "conflict" and rolling and obj.kind == "doc":
-            decision = "replace"       # 只有清单/README 允许整体替换
+        if decision == "conflict" and rolling and obj.kind in ("doc", "extra"):
+            decision = "replace"       # 只有清单/README/随附证据允许整体替换（分片永不可变）
         if decision == "conflict":
             r = heads.get(key) or {}
             reasons = []

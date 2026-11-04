@@ -125,6 +125,8 @@ python delivery/delivery_pack.py <OUT_DIR> --execute \
 ```
 
 `--include` 可重复，随附文件会进 `extra_documents` 并计入 `object_count`（分片 + 2 文档 + N 随附）。
+**默认随附**：交付目录里的 `manifest.json`（pipeline 汇总）与 `ledger.json`（逐文件账本）会自动带上，
+买家据此能自己跑 `accept.cli verify` 复算；不需要手工 `--include`。
 多个 key 各写各的前缀，**可以多台并发**，不需要等谁。
 
 ## 六、滚动上传（`--rolling`）

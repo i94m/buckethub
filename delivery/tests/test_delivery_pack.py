@@ -166,7 +166,8 @@ class TestPack(DeliveryBase):
         pipeline = json.loads((self.out / "manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(m["totals"]["tokens"], pipeline["delivered_tokens"])
         self.assertEqual(m["totals"]["parts"], len(pipeline["shards"]))
-        self.assertEqual(m["object_count"], len(m["objects"]) + 2)
+        self.assertEqual(m["object_count"],
+                         len(m["objects"]) + 2 + len(m["extra_documents"]))
 
         # 每个对象都真实存在，且自己的 sha256 与实际文件一致
         for o in m["objects"]:
@@ -463,7 +464,9 @@ class TestMergedDelivery(unittest.TestCase):
         self.assertEqual(rc, 0)
         report = json.loads((staging / dp.UPLOAD_REPORT).read_text(encoding="utf-8"))
         self.assertTrue(report["ok"])
-        self.assertEqual(report["object_count"], {"expected": 6, "remote": 6})
+        m = json.loads((staging / dp.DELIVERY_MANIFEST).read_text(encoding="utf-8"))
+        self.assertEqual(report["object_count"]["expected"],
+                         len(m["objects"]) + 2 + len(m["extra_documents"]))
         self.assertEqual(len(report["readback"]), 3)
 
     def test_part_number_gap_refused(self):
@@ -576,11 +579,15 @@ class TestRolling(unittest.TestCase):
         m2 = json.loads((self.sim / "objects" / "2026-11-04" / "delivery-manifest.json").read_text())
         m1 = json.loads((self.st1 / dp.DELIVERY_MANIFEST).read_text())
         self.assertGreater(len(m2["files"]), len(m1["files"]), "清单要体现新增文件")
-        self.assertEqual(m2["object_count"], len(m2["objects"]) + 2)
+        self.assertEqual(m2["object_count"],
+                         len(m2["objects"]) + 2 + len(m2.get("extra_documents") or []))
         report = json.loads((self.st2 / dp.UPLOAD_REPORT).read_text())
         self.assertTrue(report["rolling"])
-        self.assertEqual(sorted(report["replaced"]),
-                         ["2026-11-04/README.md", "2026-11-04/delivery-manifest.json"])
+        self.assertIn("2026-11-04/README.md", report["replaced"])
+        self.assertIn("2026-11-04/delivery-manifest.json", report["replaced"])
+        for extra in ("manifest.json", "ledger.json"):
+            if extra in [e["name"] for e in m2.get("extra_documents") or []]:
+                self.assertIn(f"2026-11-04/{extra}", report["replaced"])
         self.assertEqual(len(report["snapshots"]), 1)
         self.assertEqual(report["object_count"]["expected"], m2["object_count"])
         self.assertEqual(report["object_count"]["remote"], m2["object_count"],
@@ -695,7 +702,8 @@ class TestRollingMultiWriter(unittest.TestCase):
         keys = {f["source_key"] for f in m2["files"]}
         self.assertEqual(keys, {f["source_key"] for f in m1["files"]} |
                          {"gpt-6-sol-0005-20261001.jsonl"})
-        self.assertEqual(m2["object_count"], len(m2["objects"]) + 2)
+        self.assertEqual(m2["object_count"],
+                         len(m2["objects"]) + 2 + len(m2.get("extra_documents") or []))
         self.assertEqual(m2["rolling"]["rounds"], 2)
         self.assertEqual(m2["rolling"]["previous_delivery_id"], m1["delivery_id"])
 
@@ -752,8 +760,11 @@ class TestPerSourceSubdir(unittest.TestCase):
         base = self.sim / "objects" / prefix
         self.assertTrue((base / "delivery-manifest.json").exists())
         m = json.loads((base / "delivery-manifest.json").read_text())
-        self.assertEqual([e["name"] for e in m["extra_documents"]], ["accept-report.json"])
-        self.assertEqual(m["object_count"], len(m["objects"]) + 3)  # 分片 + 2 文档 + 1 随附
+        names = [e["name"] for e in m["extra_documents"]]
+        self.assertIn("accept-report.json", names)
+        self.assertIn("manifest.json", names)          # 默认随附证据
+        self.assertIn("ledger.json", names)
+        self.assertEqual(m["object_count"], len(m["objects"]) + 2 + len(names))
         files = [p.name for p in base.rglob("*") if p.is_file()]
         self.assertEqual(len(files), m["object_count"])
         readme = (base / "README.md").read_text(encoding="utf-8")
