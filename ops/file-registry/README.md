@@ -37,6 +37,13 @@
 > 四段制下与上一版三段草案的差异：HK 1–10 → 1–7；M4 11–21 → 8–14；Macbook Pro 22–30 → 15–22；
 > 新第四段 23–30 归 Alienware。**已完整落盘的 key 不重下**，按落盘机归属优先。
 
+## 交付单元（2026-11-04 起）：一个 key 一件
+
+合并层与 `rank_base` 已退役，`order` 的全局归一不再需要。每个已完整落盘的 key 在本机就地走
+`index → plan → emit → verify → pack`（同一 out-dir，`--local-dir` 零 egress），产出该 key 自己的
+`<源文件>.jsonl(.zst)` + `delivery-manifest.json` + `README.md`。台账的 `delivery_status`
+只在 `manifest.STOP_REASON=corpus_exhausted` 且 `verify ok=true` 时写 `delivered`。
+
 ## 机器本地根目录
 
 | 机器 | 本地根目录 |
