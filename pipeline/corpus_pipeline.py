@@ -34,6 +34,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import socket
 import sys
 import threading
@@ -527,6 +528,22 @@ class State:
 
 # --------------------------------------------------------------------- 三个阶段
 
+_CONTENT_RANGE_TOTAL = re.compile(r"/(\d+)\s*$")
+
+
+def _is_transient_read_error(exc) -> bool:
+    """只把「传输层断流」当可重试，鉴权/参数类错误照旧抛出去。"""
+    name = type(exc).__name__
+    if name in (
+        "IncompleteReadError", "ProtocolError", "ReadTimeoutError",
+        "ChunkedEncodingError", "ResponseStreamingError", "ConnectionError",
+        "ConnectionResetError", "ConnectionAbortedError", "BrokenPipeError",
+        "TimeoutError", "SSLError",
+    ):
+        return True
+    return isinstance(exc, (OSError, EOFError))
+
+
 def _iter_file_lines(args, client, key, start_offset=0):
     """从 start_offset（必须是行边界）起逐行产出 (offset, raw)。"""
     if args.local_dir:
@@ -538,19 +555,63 @@ def _iter_file_lines(args, client, key, start_offset=0):
                 offset += len(raw)
         return
     import io
-    if start_offset:
-        body = client.get_object(Bucket=args.bucket, Key=key,
-                                 Range=f"bytes={start_offset}-")["Body"]
-    else:
-        body = client.get_object(Bucket=args.bucket, Key=key)["Body"]
-    stream = io.BufferedReader(body, buffer_size=1 << 22)
-    offset = start_offset
-    try:
-        for raw in stream:
-            yield offset, raw
-            offset += len(raw)
-    finally:
-        stream.close()
+
+    offset = start_offset          # 始终停在「完整行」的边界上
+    total = None                   # 对象总字节数（从 ContentRange/ContentLength 取）
+    stalls = 0                     # 连续「零进展」的断流次数
+    while True:
+        kw = dict(Bucket=args.bucket, Key=key)
+        if offset:
+            kw["Range"] = f"bytes={offset}-"
+        resp = client.get_object(**kw)
+        m = _CONTENT_RANGE_TOTAL.search(str(resp.get("ContentRange") or ""))
+        if m:
+            total = int(m.group(1))
+        elif offset == 0 and resp.get("ContentLength") is not None:
+            total = int(resp["ContentLength"])
+        body = resp["Body"]
+        stream = io.BufferedReader(body, buffer_size=1 << 22)
+        progressed = False
+        cut = False
+        try:
+            while True:
+                try:
+                    raw = stream.readline()
+                except Exception as exc:            # 断流（IncompleteReadError 等）
+                    if not _is_transient_read_error(exc):
+                        raise
+                    cut = True
+                    break
+                if not raw:                          # 行边界处断掉，或真的 EOF
+                    if total is not None and offset < total:
+                        cut = True
+                    else:
+                        return
+                    break
+                if not raw.endswith(b"\n"):          # 断在半行上
+                    if total is not None and offset + len(raw) >= total:
+                        # 源对象本身末尾没有换行：按原样交付这一行
+                        yield offset, raw
+                        offset += len(raw)
+                        return
+                    cut = True                       # 丢弃半行，从它的起点重读
+                    break
+                yield offset, raw
+                offset += len(raw)
+                progressed = True
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+        if not cut:
+            return
+        stalls = 0 if progressed else stalls + 1
+        if stalls >= 5:
+            raise RuntimeError(
+                f"{key}: 连续 {stalls} 次断流且零进展，放弃（offset={offset}）")
+        # 断点续读：offset 由「最后一个完整行」推出，天然是行边界，
+        # 因此与 state.json 的 partial 记账口径一致，重读不会产生重复行。
 
 
 def _scan_file(args, client, key, start_offset, file_rank, budget, on_progress=None):
