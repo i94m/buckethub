@@ -17,7 +17,7 @@
 | `local_copy` | 整对象本地副本绝对路径；`-` = 该机未落盘 |
 | `download_status` | `pending` / `downloading` / `partial N%` / `done` / `failed` |
 | `index_status` | `pending` / `done` / `-`（未开始，因为副本还没落盘） |
-| `delivery_status` | `pending` / `delivered` / `not_delivered`（文件边界停）/ `zero_kept` |
+| `delivery_status` | `pending` / `delivered` / `verify_red`（出件了但验收未绿，原因写在该行对应 out-dir 的 `accept-report.json`）/ `not_delivered` / `zero_kept` |
 
 状态只写真值：`local_copy` 指向的文件**实际存在且字节数与 `bytes` 一致**才允许写 `done`。
 
